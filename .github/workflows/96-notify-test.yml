@@ -22,6 +22,11 @@ name: 邮件自检
 #   ③ 逐个探测 17 个常见 Secret 名，告诉你哪些真的存在
 #   ④ 给出结论与排查顺序
 #   ⑤ 探测仓库 Environments 名单（STOCK_LIST 是否还在）
+#
+# 【安全约束】
+# 本仓库是公开仓库，报告会被提交回仓库，所以报告里
+# 只有「变量名 + 长度 + 判定」，绝不出现任何真实邮箱或密钥。
+# 异常消息也会先经过邮箱掩码与换行显式化再输出。
 
 on:
   workflow_dispatch:
@@ -36,7 +41,6 @@ on:
       - '.github/workflows/96-notify-test.yml'
 
 # 需要 write 才能把体检报告提交回仓库。
-# 本仓库是公开仓库，报告里只有「变量名 + 长度」，不含任何配置内容。
 permissions:
   contents: write
 
@@ -240,7 +244,7 @@ jobs:
           EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME }}
         run: |
           python - <<'PY'
-          import os, smtplib, sys
+          import os, re, smtplib, sys
           from datetime import datetime
           from email.mime.text import MIMEText
           from email.mime.multipart import MIMEMultipart
@@ -270,6 +274,22 @@ jobs:
               _orig_print(*args, **kwargs)
               _orig_print(*args, file=_report, **kwargs)
 
+          def mask_email(addr):
+              local, _, domain = str(addr).partition("@")
+              if not domain:
+                  return "***"
+              if len(local) <= 3:
+                  return local[:1] + "***@" + domain
+              return local[:3] + "***@" + domain
+
+          def sanitize(text):
+              # 掩掉邮箱地址，并把换行显式化。
+              # 本仓库是公开的，报告会被提交回仓库，所以异常原文也不能直接输出。
+              text = re.sub(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+",
+                            lambda m: mask_email(m.group(0)), str(text))
+              text = text.replace("\r\n", "<CRLF>").replace("\n", "<LF>").replace("\r", "<CR>")
+              return text
+
           sender = (os.getenv("EMAIL_SENDER") or "").strip()
           password = (os.getenv("EMAIL_PASSWORD") or "").strip()
           raw_recv = (os.getenv("EMAIL_RECEIVERS") or "").strip()
@@ -281,14 +301,24 @@ jobs:
           print("=" * 50)
           print("发信链路实测")
           print("=" * 50)
-          if sender:
-              masked = sender[:3] + "***@" + sender.split("@")[-1]
-          else:
-              masked = "空"
-          print("EMAIL_SENDER    :", masked)
+          print("EMAIL_SENDER    :", mask_email(sender) if sender else "空")
           print("EMAIL_PASSWORD  :", ("已读到，长度 %d" % len(password)) if password else "空")
-          print("EMAIL_RECEIVERS :", ("已读到，%d 个收件人" % len(receivers)) if receivers else "空（运行时会回落到发件人自己）")
+          print("EMAIL_RECEIVERS : 值长度 %d，按英文逗号切分得到 %d 个收件人" % (len(raw_recv), len(receivers)))
           print("EMAIL_SENDER_NAME:", "已设置" if os.getenv("EMAIL_SENDER_NAME") else "(未设置，用默认值)")
+
+          # 收件人格式结构自检：只报告结构，不输出地址本身
+          if "\n" in raw_recv or "\r" in raw_recv:
+              print("")
+              print("⚠ 已定位问题：EMAIL_RECEIVERS 的值里含有换行符。")
+              print("   本项目代码只按英文逗号 split(\",\")，换行不会被切分，")
+              print("   整个值被当成单个收件人塞进 To 头，")
+              print("   构造邮件时触发 HeaderWriteError: folded header contains newline。")
+              print("   修复：多个收件人改用英文逗号分隔，例如 a@qq.com,b@qq.com")
+          elif len(receivers) == 1 and raw_recv and len(raw_recv) > len(receivers[0]) + 2:
+              print("")
+              print("⚠ EMAIL_RECEIVERS 的值长度明显大于切分出的唯一收件人长度，")
+              print("   说明中间用了逗号以外的分隔符（分号 / 空格 / 全角逗号 / 换行）。")
+              print("   修复：改用英文逗号分隔。")
 
           if not sender or not password:
               print("")
@@ -335,7 +365,7 @@ jobs:
               srv.quit()
           except smtplib.SMTPAuthenticationError as exc:
               print("")
-              print("认证失败: %s" % exc)
+              print("认证失败: %s" % sanitize(exc))
               print("EMAIL_PASSWORD 不是邮箱登录密码，必须填 SMTP 授权码。")
               print("QQ 邮箱：设置 → 账户与安全 → POP3/IMAP/SMTP 服务 → 开启 → 短信验证 → 拿 16 位授权码。")
               print("163 邮箱：设置 → POP3/SMTP/IMAP → 开启 IMAP/SMTP 服务 → 新增授权密码。")
@@ -343,7 +373,7 @@ jobs:
               sys.exit(1)
           except Exception as exc:
               print("")
-              print("发送失败: %s: %s" % (type(exc).__name__, exc))
+              print("发送失败: %s: %s" % (type(exc).__name__, sanitize(exc)))
               _report.close()
               sys.exit(1)
 
