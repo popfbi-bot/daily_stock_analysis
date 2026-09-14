@@ -1,0 +1,169 @@
+name: 邮件自检（手动）
+
+# 【这个文件解决什么问题】
+# 原项目的「每日股票分析」workflow 在日志的「📋 配置检查」段落里
+# 只打印了企业微信/飞书/Telegram/Discord/Slack 等渠道，唯独没有邮件，
+# 所以邮件配错了在日志里根本看不出来。
+#
+# 这个 workflow 补上这个盲区，手动点一次就能判断"到底是邮件配置有问题，
+# 还是任务压根没跑"。它不会自动运行，也不需要配 cron。
+#
+# 用法：Actions → 邮件自检（手动）→ Run workflow
+#   send_test_email = true   → 先列配置，再真实登录 SMTP 给自己发一封测试邮件
+#   send_test_email = false  → 只列配置，不发任何消息
+
+on:
+  workflow_dispatch:
+    inputs:
+      send_test_email:
+        description: '是否真实发送一封测试邮件'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  notify-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 创建必要目录
+        run: mkdir -p data logs reports
+
+      - name: 项目自带的通知配置检查（不发消息）
+        continue-on-error: true
+        env:
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME }}
+        run: python main.py --check-notify
+
+      - name: 真实发送一封测试邮件
+        if: ${{ github.event.inputs.send_test_email == 'true' }}
+        env:
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME }}
+        run: |
+          python - <<'PY'
+          import os, smtplib, sys
+          from datetime import datetime
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+          from email.header import Header
+          from email.utils import formataddr
+
+          SMTP_CONFIGS = {
+              "qq.com": ("smtp.qq.com", 465, True),
+              "foxmail.com": ("smtp.qq.com", 465, True),
+              "163.com": ("smtp.163.com", 465, True),
+              "126.com": ("smtp.126.com", 465, True),
+              "gmail.com": ("smtp.gmail.com", 587, False),
+              "outlook.com": ("smtp-mail.outlook.com", 587, False),
+              "hotmail.com": ("smtp-mail.outlook.com", 587, False),
+              "live.com": ("smtp-mail.outlook.com", 587, False),
+              "sina.com": ("smtp.sina.com", 465, True),
+              "sohu.com": ("smtp.sohu.com", 465, True),
+              "aliyun.com": ("smtp.aliyun.com", 465, True),
+              "139.com": ("smtp.139.com", 465, True),
+          }
+
+          sender = (os.getenv("EMAIL_SENDER") or "").strip()
+          password = (os.getenv("EMAIL_PASSWORD") or "").strip()
+          raw_recv = (os.getenv("EMAIL_RECEIVERS") or "").strip()
+          receivers = [r.strip() for r in raw_recv.split(",") if r.strip()]
+          if not receivers and sender:
+              receivers = [sender]
+
+          print("=" * 50)
+          print("邮件配置可见性检查")
+          print("=" * 50)
+          if sender:
+              masked = sender[:3] + "***@" + sender.split("@")[-1]
+          else:
+              masked = "空"
+          print("EMAIL_SENDER    :", masked)
+          print("EMAIL_PASSWORD  :", ("已读到，长度 %d" % len(password)) if password else "空")
+          print("EMAIL_RECEIVERS :", ",".join(receivers) if receivers else "空（运行时会回落到发件人自己）")
+          print("EMAIL_SENDER_NAME:", os.getenv("EMAIL_SENDER_NAME") or "(未设置，用默认值)")
+
+          if not sender or not password:
+              print("")
+              print("结论：邮件配置不完整。")
+              print("应用运行到这里只会打印『邮件配置不完整，跳过推送』然后直接 return False。")
+              print("最可能的原因：EMAIL_PASSWORD 被放在了 Settings → Variables，")
+              print("而 workflow 里写的是 secrets.EMAIL_PASSWORD，只读 Secrets，读到空值。")
+              print("EMAIL_SENDER / EMAIL_RECEIVERS 是 vars || secrets，放哪个位置都能读到。")
+              sys.exit(1)
+
+          domain = sender.split("@")[-1].lower()
+          known = domain in SMTP_CONFIGS
+          server, port, use_ssl = SMTP_CONFIGS.get(domain, ("smtp." + domain, 465, True))
+          print("")
+          print("=" * 50)
+          print("SMTP 连通测试")
+          print("=" * 50)
+          print("发件域名 %s -> %s %s:%d (SSL=%s)"
+                % (domain, "内置识别" if known else "未命中白名单，回退通用配置", server, port, use_ssl))
+          if not known:
+              print("提示：该域名不在内置白名单内。代码只会拼 smtp.<域名>:465，")
+              print("      像 vip.163.com / 企业自有域名通常拼不出可用的 SMTP 地址，会连接失败。")
+
+          subject = "邮件自检通过 - %s" % datetime.now().strftime("%Y-%m-%d %H:%M")
+          display_name = os.getenv("EMAIL_SENDER_NAME") or "daily_stock_analysis股票分析助手"
+          body = (
+              "这封邮件由 GitHub Actions 的『邮件自检』发出。\n\n"
+              "收到它，说明 EMAIL_SENDER、EMAIL_PASSWORD、收件人三者都没问题，\n"
+              "SMTP 登录和投递链路是通的。\n\n"
+              "那么收不到每日报告，原因就在任务没有运行，而不是邮件配置。\n"
+          )
+
+          msg = MIMEMultipart("alternative")
+          msg["Subject"] = Header(subject, "utf-8")
+          msg["From"] = formataddr((str(Header(display_name, "utf-8")), sender))
+          msg["To"] = ", ".join(receivers)
+          msg.attach(MIMEText(body, "plain", "utf-8"))
+
+          try:
+              if use_ssl:
+                  srv = smtplib.SMTP_SSL(server, port, timeout=30)
+              else:
+                  srv = smtplib.SMTP(server, port, timeout=30)
+                  srv.starttls()
+              srv.login(sender, password)
+              srv.send_message(msg)
+              srv.quit()
+          except smtplib.SMTPAuthenticationError as exc:
+              print("")
+              print("认证失败: %s" % exc)
+              print("EMAIL_PASSWORD 不是邮箱登录密码，必须填 SMTP 授权码。")
+              print("QQ 邮箱：设置 → 账户 → 开启 POP3/SMTP 服务 → 拿到授权码。")
+              print("163 邮箱：设置 → POP3/SMTP/IMAP → 开启并新增授权密码。")
+              sys.exit(1)
+          except Exception as exc:
+              print("")
+              print("发送失败: %s: %s" % (type(exc).__name__, exc))
+              sys.exit(1)
+
+          print("")
+          print("登录并发送成功，收件人: %s" % ",".join(receivers))
+          print("去收件箱确认一下，记得也看垃圾邮件 / 订阅邮件文件夹。")
+          PY
