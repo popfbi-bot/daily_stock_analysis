@@ -18,26 +18,27 @@ fork 不会继承上游仓库的 Secrets，填到上游等于没填。
 ================================================================
 ③ 常见 Secret 名探测（只报存在与否与长度，不含值）
 ================================================================
-   EMAIL_SENDER         邮件发件人地址                  已设置，长度 13
-   EMAIL_PASSWORD       邮件 SMTP 授权码              已设置，长度 16
-   EMAIL_RECEIVERS      收件人                      已设置，长度 28
-   EMAIL_SENDER_NAME    发件人显示名                   空 / 不存在
-   EMAIL_USER           邮件账号（别名写法）               空 / 不存在
-   EMAIL_PASS           邮件密码（别名写法）               空 / 不存在
-   EMAIL_PASSWD         邮件密码（别名写法）               空 / 不存在
-   EMAIL_AUTH_CODE      授权码（别名写法）                空 / 不存在
-   SMTP_PASSWORD        SMTP 密码（别名写法）            空 / 不存在
-   MAIL_PASSWORD        邮件密码（别名写法）               空 / 不存在
-   GEMINI_API_KEY       Gemini API Key           已设置，长度 53
-   GEMINI_API_KEYS      Gemini Key 多枚写法          空 / 不存在
-   GEMINI_KEY           Gemini Key（别名写法）         空 / 不存在
-   LLM_GEMINI_API_KEY   LLM 通道的 Gemini Key       空 / 不存在
-   GOOGLE_API_KEY       Google API Key（别名写法）     空 / 不存在
-   OPENAI_API_KEY       OpenAI Key               空 / 不存在
-   DEEPSEEK_API_KEY     DeepSeek Key             空 / 不存在
+   STOCK_LIST           自选股清单（本项目核心配置）               已设置，长度 13
+   EMAIL_SENDER         邮件发件人地址                      已设置，长度 13
+   EMAIL_PASSWORD       邮件 SMTP 授权码                  已设置，长度 16
+   EMAIL_RECEIVERS      收件人                          已设置，长度 28
+   EMAIL_SENDER_NAME    发件人显示名                       空 / 不存在
+   EMAIL_USER           邮件账号（别名写法）                   空 / 不存在
+   EMAIL_PASS           邮件密码（别名写法）                   空 / 不存在
+   EMAIL_PASSWD         邮件密码（别名写法）                   空 / 不存在
+   EMAIL_AUTH_CODE      授权码（别名写法）                    空 / 不存在
+   SMTP_PASSWORD        SMTP 密码（别名写法）                空 / 不存在
+   MAIL_PASSWORD        邮件密码（别名写法）                   空 / 不存在
+   GEMINI_API_KEY       Gemini API Key               已设置，长度 53
+   GEMINI_API_KEYS      Gemini Key 多枚写法              空 / 不存在
+   GEMINI_KEY           Gemini Key（别名写法）             空 / 不存在
+   LLM_GEMINI_API_KEY   LLM 通道的 Gemini Key           空 / 不存在
+   GOOGLE_API_KEY       Google API Key（别名写法）         空 / 不存在
+   OPENAI_API_KEY       OpenAI Key                   空 / 不存在
+   DEEPSEEK_API_KEY     DeepSeek Key                 空 / 不存在
 
 有名字被读到了。请把带「已设置」的行名，和本项目 workflow 实际使用的名字对齐：
-   本项目读取的是 EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVERS / EMAIL_SENDER_NAME
+   本项目读取的是 STOCK_LIST / EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVERS
    名字不一致时，即使值填了也不会被使用。
 
 ================================================================
@@ -70,6 +71,8 @@ SMTP 连通测试
 total_count : 0
 名单为空：本仓库目前一个 Environment 都没有。
 
-注意：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST。
-      Environment 不存在时，该 job 会在启动阶段直接失败，
-      表现为「每日股票分析」一跑就红、连日志都很少。
+说明：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST。
+      引用不存在的 environment 时，GitHub 会自动创建同名 environment，
+      所以它缺失不会让每日任务失败，下次运行时会自动重建。
+      但要注意：删除 environment 会连带删掉它下面的 environment 级 Secrets。
+      如果你曾把邮箱配置放在里面，就会一起消失。
