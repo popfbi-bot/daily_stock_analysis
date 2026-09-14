@@ -1,20 +1,27 @@
-name: 邮件自检（手动）
+name: 邮件自检
 
 # 【这个文件解决什么问题】
 # 原项目的「每日股票分析」workflow 在日志的「📋 配置检查」段落里
 # 只打印了企业微信/飞书/Telegram/Discord/Slack 等渠道，唯独没有邮件，
 # 所以邮件配错了在日志里根本看不出来。
 #
-# 这个 workflow 补上这个盲区。它不会自动运行，也不需要配 cron。
+# 这个 workflow 补上这个盲区。
 #
-# 用法：Actions → 邮件自检（手动）→ Run workflow
-#   send_test_email = true   → 体检配置，再真实登录 SMTP 发一封测试邮件
-#   send_test_email = false  → 只体检配置，不发任何消息
+# 【三种触发方式】
+#   1. 手动：Actions → 邮件自检 → Run workflow
+#      send_test_email = true   → 体检配置，再真实登录 SMTP 发一封测试邮件
+#      send_test_email = false  → 只体检配置，不发任何消息
+#   2. 自身变更：本文件被修改并推送到 main 时自动跑一次
+#      （paths 限定为只有本文件变化才触发，避免被其他提交误带动）
+#   3. 以上任一方式下，体检报告都会写到 .diag/notify-check-latest.txt，
+#      并仅在「自身变更」这种情形下提交回仓库，方便外部读取结果。
 #
-# 三段输出对应三件事：
+# 【五段输出】
 #   ① 确认这次跑的到底是哪个仓库、哪个分支
 #   ② 列出本仓库所有 Variables 的名字（不含值）
-#   ③ 逐个探测 16 个常见 Secret 名，告诉你哪些真的存在
+#   ③ 逐个探测 17 个常见 Secret 名，告诉你哪些真的存在
+#   ④ 给出结论与排查顺序
+#   ⑤ 探测仓库 Environments 名单（STOCK_LIST 是否还在）
 
 on:
   workflow_dispatch:
@@ -24,9 +31,14 @@ on:
         required: true
         default: true
         type: boolean
+  push:
+    paths:
+      - '.github/workflows/96-notify-test.yml'
 
+# 需要 write 才能把体检报告提交回仓库。
+# 本仓库是公开仓库，报告里只有「变量名 + 长度」，不含任何配置内容。
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   notify-check:
@@ -48,11 +60,11 @@ jobs:
           pip install -r requirements.txt
 
       - name: 创建必要目录
-        run: mkdir -p data logs reports
+        run: mkdir -p data logs reports .diag
 
       # ------------------------------------------------------------------
       # 配置可见性全量体检：只报告"名字在不在"，绝不打印任何值
-      # 本仓库是公开仓库，日志公开可见，所以这里刻意不输出任何配置内容
+      # 同时把同样的内容写进 .diag/notify-check-latest.txt 供外部读取
       # ------------------------------------------------------------------
       - name: 配置可见性全量体检
         env:
@@ -83,6 +95,14 @@ jobs:
         run: |
           python - <<'PY'
           import os, json, sys
+
+          os.makedirs(".diag", exist_ok=True)
+          _report = open(os.path.join(".diag", "notify-check-latest.txt"), "w", encoding="utf-8")
+          _orig_print = print
+
+          def print(*args, **kwargs):
+              _orig_print(*args, **kwargs)
+              _orig_print(*args, file=_report, **kwargs)
 
           def line(ch="=", n=64):
               print(ch * n)
@@ -118,7 +138,7 @@ jobs:
               interesting = [k for k in names if "EMAIL" in k.upper() or "GEMINI" in k.upper()]
               if interesting:
                   print("")
-                  print("其中与邮件/邮件模型相关的：", ", ".join(interesting))
+                  print("其中与邮件/Gemini 相关的：", ", ".join(interesting))
               else:
                   print("")
                   print("其中没有名字带 EMAIL 或 GEMINI 的变量。")
@@ -195,6 +215,11 @@ jobs:
               print("")
               print("  4) 仓库对不对？必须是 popfbi-bot/daily_stock_analysis。")
               print("     Secrets 不随 fork 继承，填在上游 ZhuLinsen 那边等于没填。")
+              print("")
+              print("  5) 别点错页：Settings → Integrations → Email notifications")
+              print("     是 GitHub 自己的 push 通知，和本项目完全无关，填了也不生效。")
+
+          _report.close()
           PY
 
       - name: 项目自带的通知配置检查（不发消息）
@@ -207,7 +232,7 @@ jobs:
         run: python main.py --check-notify
 
       - name: 真实发送一封测试邮件
-        if: ${{ github.event.inputs.send_test_email == 'true' }}
+        if: ${{ github.event_name == 'push' || github.event.inputs.send_test_email == 'true' }}
         env:
           EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
@@ -237,6 +262,14 @@ jobs:
               "139.com": ("smtp.139.com", 465, True),
           }
 
+          os.makedirs(".diag", exist_ok=True)
+          _report = open(os.path.join(".diag", "notify-check-latest.txt"), "a", encoding="utf-8")
+          _orig_print = print
+
+          def print(*args, **kwargs):
+              _orig_print(*args, **kwargs)
+              _orig_print(*args, file=_report, **kwargs)
+
           sender = (os.getenv("EMAIL_SENDER") or "").strip()
           password = (os.getenv("EMAIL_PASSWORD") or "").strip()
           raw_recv = (os.getenv("EMAIL_RECEIVERS") or "").strip()
@@ -244,8 +277,9 @@ jobs:
           if not receivers and sender:
               receivers = [sender]
 
+          print("")
           print("=" * 50)
-          print("邮件配置可见性检查")
+          print("发信链路实测")
           print("=" * 50)
           if sender:
               masked = sender[:3] + "***@" + sender.split("@")[-1]
@@ -258,18 +292,17 @@ jobs:
 
           if not sender or not password:
               print("")
-              print("结论：邮件配置不完整。")
+              print("结论：邮件配置不完整，跳过发信。")
               print("应用运行到这里只会打印『邮件配置不完整，跳过推送』然后直接 return False。")
-              print("具体原因请看上面第 ② ③ ④ 段体检输出，那里会指出名字到底差在哪。")
+              print("具体原因看上面第 ② ③ ④ 段体检输出，那里会指出名字到底差在哪。")
+              _report.close()
               sys.exit(1)
 
           domain = sender.split("@")[-1].lower()
           known = domain in SMTP_CONFIGS
           server, port, use_ssl = SMTP_CONFIGS.get(domain, ("smtp." + domain, 465, True))
           print("")
-          print("=" * 50)
           print("SMTP 连通测试")
-          print("=" * 50)
           print("发件域名 %s -> %s %s:%d (SSL=%s)"
                 % (domain, "内置识别" if known else "未命中白名单，回退通用配置", server, port, use_ssl))
           if not known:
@@ -304,15 +337,105 @@ jobs:
               print("")
               print("认证失败: %s" % exc)
               print("EMAIL_PASSWORD 不是邮箱登录密码，必须填 SMTP 授权码。")
-              print("QQ 邮箱：设置 → 账户 → 开启 POP3/SMTP 服务 → 拿到授权码。")
-              print("163 邮箱：设置 → POP3/SMTP/IMAP → 开启并新增授权密码。")
+              print("QQ 邮箱：设置 → 账户与安全 → POP3/IMAP/SMTP 服务 → 开启 → 短信验证 → 拿 16 位授权码。")
+              print("163 邮箱：设置 → POP3/SMTP/IMAP → 开启 IMAP/SMTP 服务 → 新增授权密码。")
+              _report.close()
               sys.exit(1)
           except Exception as exc:
               print("")
               print("发送失败: %s: %s" % (type(exc).__name__, exc))
+              _report.close()
               sys.exit(1)
 
           print("")
           print("登录并发送成功，收件人共 %d 个。" % len(receivers))
           print("去收件箱确认一下，记得也看垃圾邮件 / 订阅邮件文件夹。")
+          _report.close()
           PY
+
+      # ------------------------------------------------------------------
+      # 探测仓库 Environments 名单。
+      # 起因：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST，
+      # 如果这个 Environment 被删掉，每日任务会在启动阶段直接失败。
+      # 该接口对 GITHUB_TOKEN 常常返回 403，读不到就只给指引，不算失败。
+      # ------------------------------------------------------------------
+      - name: 探测仓库 Environments 名单
+        continue-on-error: true
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, json, urllib.request, urllib.error
+
+          repo = os.getenv("GH_REPO")
+          token = os.getenv("GH_TOKEN") or ""
+          url = "https://api.github.com/repos/%s/environments" % repo
+
+          print("")
+          print("=" * 64)
+          print("⑤ 仓库 Environments 名单（判断 environment: STOCK_LIST 是否还在）")
+          print("=" * 64)
+
+          req = urllib.request.Request(url, headers={
+              "Accept": "application/vnd.github+json",
+              "Authorization": "Bearer " + token,
+              "User-Agent": "notify-check",
+              "X-GitHub-Api-Version": "2022-11-28",
+          })
+          try:
+              body = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
+              data = json.loads(body)
+              envs = data.get("environments") or []
+              names = sorted(e.get("name", "") for e in envs)
+              print("total_count :", data.get("total_count"))
+              if not names:
+                  print("名单为空：本仓库目前一个 Environment 都没有。")
+                  print("")
+                  print("注意：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST。")
+                  print("      Environment 不存在时，该 job 会在启动阶段直接失败，")
+                  print("      表现为「每日股票分析」一跑就红、连日志都很少。")
+              else:
+                  print("名单如下：")
+                  for n in names:
+                      print("   -", n)
+                  print("")
+                  if "STOCK_LIST" in names:
+                      print("STOCK_LIST 存在，每日任务的 environment 声明有效。")
+                  else:
+                      print("STOCK_LIST 不在名单里。")
+                      print("00-daily-analysis.yml 的 job 声明了 environment: STOCK_LIST，")
+                      print("该环境缺失会让每日任务在启动阶段失败。")
+                      print("处理：Settings → Environments → New environment，名字填 STOCK_LIST。")
+                      print("（不往里面放任何东西也行，声明对得上就能正常启动。）")
+          except urllib.error.HTTPError as exc:
+              print("接口返回 HTTP %s：GITHUB_TOKEN 没有读取 Environments 的权限。" % exc.code)
+              print("无法自动判断，请手动看一眼：")
+              print("   Settings → Environments")
+              print("   https://github.com/%s/settings/environments" % repo)
+              print("如果列表为空，而 00-daily-analysis.yml 里写着 environment: STOCK_LIST，")
+              print("请新建一个同名 Environment（内容可留空）。")
+          except Exception as exc:
+              print("探测失败：%s: %s" % (type(exc).__name__, exc))
+              print("请手动查看：https://github.com/%s/settings/environments" % repo)
+          PY
+
+      # ------------------------------------------------------------------
+      # 仅「本文件自身被推送修改」时把报告提交回仓库，方便外部读取结果。
+      # 手动点 Run workflow 时不提交，避免产生无意义的提交。
+      # 提交信息带 [skip ci]，确保不会自己触发自己。
+      # ------------------------------------------------------------------
+      - name: 把体检报告提交回仓库（仅自身变更触发时）
+        if: ${{ github.event_name == 'push' }}
+        continue-on-error: true
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f .diag/notify-check-latest.txt
+          if git diff --cached --quiet; then
+            echo "报告内容无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore(diag): 更新邮件自检报告 [skip ci]"
+          git push
+          echo "报告已提交到 .diag/notify-check-latest.txt"
