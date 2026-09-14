@@ -1,0 +1,49 @@
+name: auto-screen
+
+on:
+  schedule:
+    # 工作日北京时间 17:00（UTC 09:00）盘后选股，赶在主任务 18:00 之前写回 STOCK_LIST
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:
+
+# 写回 Repository Variable(STOCK_LIST) 需要 actions: write
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: 技术面选股
+        env:
+          UNIVERSE_SIZE: '250'
+          MAX_STOCKS: '15'
+          MIN_STOCKS: '5'
+          STOCK_LIST_FALLBACK: '600519'
+          DRY_RUN: '1'
+          OUTPUT_FILE: selected.txt
+        run: |
+          python auto_screen.py
+          echo "本轮入选: $(cat selected.txt)"
+
+      - name: 写回 STOCK_LIST 变量（供主任务读取）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STOCKS="$(cat selected.txt)"
+          if [ -z "$STOCKS" ]; then
+            echo "选股结果为空，跳过写回"
+            exit 0
+          fi
+          gh variable set STOCK_LIST --body "$STOCKS"
+          echo "已更新 STOCK_LIST: $STOCKS"
