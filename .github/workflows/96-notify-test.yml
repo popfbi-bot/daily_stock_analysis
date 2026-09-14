@@ -232,7 +232,7 @@ jobs:
         run: python main.py --check-notify
 
       - name: 真实发送一封测试邮件
-        if: ${{ github.event_name == 'push' || github.event.inputs.send_test_email == 'true' }}
+        if: ${{ always() && (github.event_name == 'push' || github.event.inputs.send_test_email == 'true') }}
         env:
           EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
@@ -359,13 +359,18 @@ jobs:
       # 如果这个 Environment 被删掉，每日任务会在启动阶段直接失败。
       # 该接口对 GITHUB_TOKEN 常常返回 403，读不到就只给指引，不算失败。
       # ------------------------------------------------------------------
+      # 必须写 if: always()。GitHub Actions 在某一步失败后会跳过后续所有步骤，
+      # continue-on-error 只保证"这步失败不算 job 失败"，并不能让流程继续。
+      # 少了 always()，发信步骤一失败，下面的探测与报告回传就全被跳过，
+      # 结果就是只看得到一个红叉、什么诊断信息都拿不到。
       - name: 探测仓库 Environments 名单
+        if: ${{ always() }}
         continue-on-error: true
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python - <<'PY'
+          python - <<'PY' | tee -a .diag/notify-check-latest.txt
           import os, json, urllib.request, urllib.error
 
           repo = os.getenv("GH_REPO")
@@ -426,8 +431,13 @@ jobs:
       # 提交信息带 [skip ci]，确保不会自己触发自己。
       # ------------------------------------------------------------------
       - name: 把体检报告提交回仓库
+        if: ${{ always() }}
         continue-on-error: true
         run: |
+          if [ ! -f .diag/notify-check-latest.txt ]; then
+            echo "报告文件不存在，跳过提交"
+            exit 0
+          fi
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -f .diag/notify-check-latest.txt
