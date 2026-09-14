@@ -19,9 +19,9 @@ name: 邮件自检
 # 【五段输出】
 #   ① 确认这次跑的到底是哪个仓库、哪个分支
 #   ② 列出本仓库所有 Variables 的名字（不含值）
-#   ③ 逐个探测 17 个常见 Secret 名，告诉你哪些真的存在
+#   ③ 逐个探测常见 Secret 名（含 STOCK_LIST），告诉你哪些真的存在
 #   ④ 给出结论与排查顺序
-#   ⑤ 探测仓库 Environments 名单（STOCK_LIST 是否还在）
+#   ⑤ 探测仓库 Environments 名单
 #
 # 【安全约束】
 # 本仓库是公开仓库，报告会被提交回仓库，所以报告里
@@ -83,6 +83,7 @@ jobs:
           SEC_EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SEC_EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
           SEC_EMAIL_SENDER_NAME: ${{ secrets.EMAIL_SENDER_NAME }}
+          SEC_STOCK_LIST: ${{ secrets.STOCK_LIST }}
           SEC_EMAIL_USER: ${{ secrets.EMAIL_USER }}
           SEC_EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           SEC_EMAIL_PASSWD: ${{ secrets.EMAIL_PASSWD }}
@@ -153,6 +154,7 @@ jobs:
           print("③ 常见 Secret 名探测（只报存在与否与长度，不含值）")
           line()
           candidates = [
+              ("STOCK_LIST", "自选股清单（本项目核心配置）"),
               ("EMAIL_SENDER", "邮件发件人地址"),
               ("EMAIL_PASSWORD", "邮件 SMTP 授权码"),
               ("EMAIL_RECEIVERS", "收件人"),
@@ -179,15 +181,15 @@ jobs:
                   status = "已设置，长度 %d" % len(val)
               else:
                   status = "空 / 不存在"
-              print("   %-20s %-24s %s" % (name, desc, status))
+              print("   %-20s %-28s %s" % (name, desc, status))
 
           print("")
           if not found_any:
-              print("所有 17 个候选名全部为空。")
+              print("所有候选名全部为空。")
               print("说明这个仓库的 Actions 两层（Variables / Secrets）都读不到任何配置。")
           else:
               print("有名字被读到了。请把带「已设置」的行名，和本项目 workflow 实际使用的名字对齐：")
-              print("   本项目读取的是 EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVERS / EMAIL_SENDER_NAME")
+              print("   本项目读取的是 STOCK_LIST / EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVERS")
               print("   名字不一致时，即使值填了也不会被使用。")
 
           print("")
@@ -385,8 +387,7 @@ jobs:
 
       # ------------------------------------------------------------------
       # 探测仓库 Environments 名单。
-      # 起因：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST，
-      # 如果这个 Environment 被删掉，每日任务会在启动阶段直接失败。
+      # 起因：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST。
       # 该接口对 GITHUB_TOKEN 常常返回 403，读不到就只给指引，不算失败。
       # ------------------------------------------------------------------
       # 必须写 if: always()。GitHub Actions 在某一步失败后会跳过后续所有步骤，
@@ -427,29 +428,28 @@ jobs:
               if not names:
                   print("名单为空：本仓库目前一个 Environment 都没有。")
                   print("")
-                  print("注意：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST。")
-                  print("      Environment 不存在时，该 job 会在启动阶段直接失败，")
-                  print("      表现为「每日股票分析」一跑就红、连日志都很少。")
+                  print("说明：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST。")
+                  print("      引用不存在的 environment 时，GitHub 会自动创建同名 environment，")
+                  print("      所以它缺失不会让每日任务失败，下次运行时会自动重建。")
+                  print("      但要注意：删除 environment 会连带删掉它下面的 environment 级 Secrets。")
+                  print("      如果你曾把邮箱配置放在里面，就会一起消失。")
               else:
                   print("名单如下：")
                   for n in names:
                       print("   -", n)
                   print("")
                   if "STOCK_LIST" in names:
-                      print("STOCK_LIST 存在，每日任务的 environment 声明有效。")
+                      print("STOCK_LIST 存在（由 workflow 的 environment 声明自动创建）。")
+                      print("注意：这里的 STOCK_LIST 是 environment 名字，")
+                      print("      和自选股清单那个同名 Secret 不是一回事。")
                   else:
-                      print("STOCK_LIST 不在名单里。")
-                      print("00-daily-analysis.yml 的 job 声明了 environment: STOCK_LIST，")
-                      print("该环境缺失会让每日任务在启动阶段失败。")
-                      print("处理：Settings → Environments → New environment，名字填 STOCK_LIST。")
-                      print("（不往里面放任何东西也行，声明对得上就能正常启动。）")
+                      print("STOCK_LIST 不在名单里，但这不会导致失败：")
+                      print("workflow 引用不存在的 environment 时 GitHub 会自动创建它。")
           except urllib.error.HTTPError as exc:
               print("接口返回 HTTP %s：GITHUB_TOKEN 没有读取 Environments 的权限。" % exc.code)
               print("无法自动判断，请手动看一眼：")
               print("   Settings → Environments")
               print("   https://github.com/%s/settings/environments" % repo)
-              print("如果列表为空，而 00-daily-analysis.yml 里写着 environment: STOCK_LIST，")
-              print("请新建一个同名 Environment（内容可留空）。")
           except Exception as exc:
               print("探测失败：%s: %s" % (type(exc).__name__, exc))
               print("请手动查看：https://github.com/%s/settings/environments" % repo)
