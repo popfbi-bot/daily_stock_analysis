@@ -5,12 +5,16 @@ name: 邮件自检（手动）
 # 只打印了企业微信/飞书/Telegram/Discord/Slack 等渠道，唯独没有邮件，
 # 所以邮件配错了在日志里根本看不出来。
 #
-# 这个 workflow 补上这个盲区，手动点一次就能判断"到底是邮件配置有问题，
-# 还是任务压根没跑"。它不会自动运行，也不需要配 cron。
+# 这个 workflow 补上这个盲区。它不会自动运行，也不需要配 cron。
 #
 # 用法：Actions → 邮件自检（手动）→ Run workflow
-#   send_test_email = true   → 先列配置，再真实登录 SMTP 给自己发一封测试邮件
-#   send_test_email = false  → 只列配置，不发任何消息
+#   send_test_email = true   → 体检配置，再真实登录 SMTP 发一封测试邮件
+#   send_test_email = false  → 只体检配置，不发任何消息
+#
+# 三段输出对应三件事：
+#   ① 确认这次跑的到底是哪个仓库、哪个分支
+#   ② 列出本仓库所有 Variables 的名字（不含值）
+#   ③ 逐个探测 16 个常见 Secret 名，告诉你哪些真的存在
 
 on:
   workflow_dispatch:
@@ -45,6 +49,153 @@ jobs:
 
       - name: 创建必要目录
         run: mkdir -p data logs reports
+
+      # ------------------------------------------------------------------
+      # 配置可见性全量体检：只报告"名字在不在"，绝不打印任何值
+      # 本仓库是公开仓库，日志公开可见，所以这里刻意不输出任何配置内容
+      # ------------------------------------------------------------------
+      - name: 配置可见性全量体检
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_EVENT: ${{ github.event_name }}
+          GH_REF: ${{ github.ref }}
+          GH_WORKFLOW: ${{ github.workflow_ref }}
+          GH_ACTOR: ${{ github.actor }}
+          VARS_JSON: ${{ toJSON(vars) }}
+
+          SEC_EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          SEC_EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          SEC_EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
+          SEC_EMAIL_SENDER_NAME: ${{ secrets.EMAIL_SENDER_NAME }}
+          SEC_EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          SEC_EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          SEC_EMAIL_PASSWD: ${{ secrets.EMAIL_PASSWD }}
+          SEC_EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
+          SEC_SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SEC_MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          SEC_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SEC_GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          SEC_GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          SEC_LLM_GEMINI_API_KEY: ${{ secrets.LLM_GEMINI_API_KEY }}
+          SEC_GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          SEC_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SEC_DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os, json, sys
+
+          def line(ch="=", n=64):
+              print(ch * n)
+
+          line()
+          print("① 这次到底跑的是哪个仓库")
+          line()
+          print("仓库        :", os.getenv("GH_REPO"))
+          print("触发事件    :", os.getenv("GH_EVENT"))
+          print("分支 / ref  :", os.getenv("GH_REF"))
+          print("workflow    :", os.getenv("GH_WORKFLOW"))
+          print("触发人      :", os.getenv("GH_ACTOR"))
+          print("")
+          print("请核对上面这个仓库，必须就是你填 Secrets 的那一个。")
+          print("fork 不会继承上游仓库的 Secrets，填到上游等于没填。")
+
+          print("")
+          line()
+          print("② 本仓库 Variables 名字清单（不含值）")
+          line()
+          raw = os.getenv("VARS_JSON") or "{}"
+          try:
+              data = json.loads(raw)
+          except Exception:
+              data = {}
+          if not isinstance(data, dict) or not data:
+              print("全部为空：这个仓库一个 Variable 都没建。")
+          else:
+              names = sorted(data.keys())
+              print("共 %d 个：" % len(names))
+              for k in names:
+                  print("   -", k)
+              interesting = [k for k in names if "EMAIL" in k.upper() or "GEMINI" in k.upper()]
+              if interesting:
+                  print("")
+                  print("其中与邮件/邮件模型相关的：", ", ".join(interesting))
+              else:
+                  print("")
+                  print("其中没有名字带 EMAIL 或 GEMINI 的变量。")
+                  print("如果你确实在 Variables 标签页建过，名字应该会出现在这里。")
+
+          print("")
+          line()
+          print("③ 常见 Secret 名探测（只报存在与否与长度，不含值）")
+          line()
+          candidates = [
+              ("EMAIL_SENDER", "邮件发件人地址"),
+              ("EMAIL_PASSWORD", "邮件 SMTP 授权码"),
+              ("EMAIL_RECEIVERS", "收件人"),
+              ("EMAIL_SENDER_NAME", "发件人显示名"),
+              ("EMAIL_USER", "邮件账号（别名写法）"),
+              ("EMAIL_PASS", "邮件密码（别名写法）"),
+              ("EMAIL_PASSWD", "邮件密码（别名写法）"),
+              ("EMAIL_AUTH_CODE", "授权码（别名写法）"),
+              ("SMTP_PASSWORD", "SMTP 密码（别名写法）"),
+              ("MAIL_PASSWORD", "邮件密码（别名写法）"),
+              ("GEMINI_API_KEY", "Gemini API Key"),
+              ("GEMINI_API_KEYS", "Gemini Key 多枚写法"),
+              ("GEMINI_KEY", "Gemini Key（别名写法）"),
+              ("LLM_GEMINI_API_KEY", "LLM 通道的 Gemini Key"),
+              ("GOOGLE_API_KEY", "Google API Key（别名写法）"),
+              ("OPENAI_API_KEY", "OpenAI Key"),
+              ("DEEPSEEK_API_KEY", "DeepSeek Key"),
+          ]
+          found_any = False
+          for name, desc in candidates:
+              val = os.getenv("SEC_" + name) or ""
+              if val:
+                  found_any = True
+                  status = "已设置，长度 %d" % len(val)
+              else:
+                  status = "空 / 不存在"
+              print("   %-20s %-24s %s" % (name, desc, status))
+
+          print("")
+          if not found_any:
+              print("所有 17 个候选名全部为空。")
+              print("说明这个仓库的 Actions 两层（Variables / Secrets）都读不到任何配置。")
+          else:
+              print("有名字被读到了。请把带「已设置」的行名，和本项目 workflow 实际使用的名字对齐：")
+              print("   本项目读取的是 EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVERS / EMAIL_SENDER_NAME")
+              print("   名字不一致时，即使值填了也不会被使用。")
+
+          print("")
+          line()
+          print("④ 结论与排查顺序")
+          line()
+          sender = (os.getenv("SEC_EMAIL_SENDER") or "").strip()
+          password = (os.getenv("SEC_EMAIL_PASSWORD") or "").strip()
+          if sender and password:
+              print("邮件三要素已就位，可以继续看下一段输出的真实发送结果。")
+          else:
+              print("邮件配置不完整。而且要注意：这不是「值填错了」，")
+              print("是 EMAIL_SENDER / EMAIL_PASSWORD 这两个名字在这个仓库里根本查不到。")
+              print("")
+              print("按顺序排查（都在 仓库页 → Settings → Secrets and variables）：")
+              print("")
+              print("  1) 左边栏点的是不是 Actions 这一项？")
+              print("     如果点成了 Codespaces 或 Dependabot，名字存在那边的库里，")
+              print("     Actions 读不到，症状就是这里全空。")
+              print("")
+              print("  2) 在 Actions 里面，Secret 要建在 Secrets 标签页，不是 Variables 标签页。")
+              print("     本项目的 workflow 里 EMAIL_SENDER / EMAIL_RECEIVERS / EMAIL_SENDER_NAME")
+              print("     写成 vars 或 secrets 都认，但 EMAIL_PASSWORD 只读 secrets。")
+              print("     如果你把授权码建成了 Variable，会读不到。")
+              print("")
+              print("  3) 是不是建在 Settings → Environments 里了？")
+              print("     Environment secrets 只有在 workflow 的 job 上写 environment: 名字")
+              print("     才会注入。本项目没写，所以读不到。请改建到仓库级 Secrets。")
+              print("")
+              print("  4) 仓库对不对？必须是 popfbi-bot/daily_stock_analysis。")
+              print("     Secrets 不随 fork 继承，填在上游 ZhuLinsen 那边等于没填。")
+          PY
 
       - name: 项目自带的通知配置检查（不发消息）
         continue-on-error: true
@@ -102,16 +253,14 @@ jobs:
               masked = "空"
           print("EMAIL_SENDER    :", masked)
           print("EMAIL_PASSWORD  :", ("已读到，长度 %d" % len(password)) if password else "空")
-          print("EMAIL_RECEIVERS :", ",".join(receivers) if receivers else "空（运行时会回落到发件人自己）")
-          print("EMAIL_SENDER_NAME:", os.getenv("EMAIL_SENDER_NAME") or "(未设置，用默认值)")
+          print("EMAIL_RECEIVERS :", ("已读到，%d 个收件人" % len(receivers)) if receivers else "空（运行时会回落到发件人自己）")
+          print("EMAIL_SENDER_NAME:", "已设置" if os.getenv("EMAIL_SENDER_NAME") else "(未设置，用默认值)")
 
           if not sender or not password:
               print("")
               print("结论：邮件配置不完整。")
               print("应用运行到这里只会打印『邮件配置不完整，跳过推送』然后直接 return False。")
-              print("最可能的原因：EMAIL_PASSWORD 被放在了 Settings → Variables，")
-              print("而 workflow 里写的是 secrets.EMAIL_PASSWORD，只读 Secrets，读到空值。")
-              print("EMAIL_SENDER / EMAIL_RECEIVERS 是 vars || secrets，放哪个位置都能读到。")
+              print("具体原因请看上面第 ② ③ ④ 段体检输出，那里会指出名字到底差在哪。")
               sys.exit(1)
 
           domain = sender.split("@")[-1].lower()
@@ -164,6 +313,6 @@ jobs:
               sys.exit(1)
 
           print("")
-          print("登录并发送成功，收件人: %s" % ",".join(receivers))
+          print("登录并发送成功，收件人共 %d 个。" % len(receivers))
           print("去收件箱确认一下，记得也看垃圾邮件 / 订阅邮件文件夹。")
           PY
