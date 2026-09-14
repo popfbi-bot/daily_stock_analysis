@@ -66,6 +66,7 @@ def test_daily_analysis_maps_all_provider_template_channels() -> None:
         prefix = f"LLM_{channel.upper()}_"
         for suffix in (
             "PROTOCOL",
+            "API_SURFACE",
             "BASE_URL",
             "API_KEY",
             "API_KEYS",
@@ -88,10 +89,59 @@ def test_daily_analysis_keeps_channel_secrets_in_secrets_context() -> None:
             key = f"LLM_{upper}_{suffix}"
             assert env[key] == f"${{{{ secrets.{key} }}}}"
 
-        for suffix in ("PROTOCOL", "BASE_URL", "MODELS", "ENABLED", "EXTRA_HEADERS"):
+        for suffix in ("PROTOCOL", "API_SURFACE", "BASE_URL", "MODELS", "ENABLED", "EXTRA_HEADERS"):
             key = f"LLM_{upper}_{suffix}"
             assert f"vars.{key}" in env[key]
             assert f"secrets.{key}" in env[key]
+
+
+def test_daily_analysis_maps_usage_hmac_config_safely() -> None:
+    env = _load_daily_analysis_env()
+
+    assert env["LLM_USAGE_HMAC_SECRET"] == "${{ secrets.LLM_USAGE_HMAC_SECRET }}"
+    assert "vars.LLM_USAGE_HMAC_SECRET" not in env["LLM_USAGE_HMAC_SECRET"]
+    assert "vars.LLM_USAGE_HMAC_KEY_VERSION" in env["LLM_USAGE_HMAC_KEY_VERSION"]
+    assert "secrets.LLM_USAGE_HMAC_KEY_VERSION" in env["LLM_USAGE_HMAC_KEY_VERSION"]
+
+
+def test_daily_analysis_maps_prompt_cache_config() -> None:
+    env = _load_daily_analysis_env()
+
+    for key in (
+        "LLM_PROMPT_CACHE_TELEMETRY_ENABLED",
+        "LLM_PROMPT_CACHE_HINTS_ENABLED",
+        "LLM_PROMPT_CACHE_DIAGNOSTICS_LEVEL",
+    ):
+        assert key in env
+        assert f"vars.{key}" in env[key]
+        assert f"secrets.{key}" in env[key]
+
+
+def test_daily_analysis_maps_generation_backend_runtime_config() -> None:
+    env = _load_daily_analysis_env()
+
+    for key in (
+        "GENERATION_BACKEND",
+        "GENERATION_FALLBACK_BACKEND",
+        "GENERATION_BACKEND_TIMEOUT_SECONDS",
+        "GENERATION_BACKEND_MAX_OUTPUT_BYTES",
+        "GENERATION_BACKEND_MAX_CONCURRENCY",
+        "LOCAL_CLI_BACKEND_MAX_CONCURRENCY",
+        "AGENT_GENERATION_BACKEND",
+    ):
+        assert key in env
+        assert f"vars.{key}" in env[key]
+        assert f"secrets.{key}" in env[key]
+
+
+def test_daily_analysis_generation_fallback_defaults_to_litellm() -> None:
+    env = _load_daily_analysis_env()
+    expression = env["GENERATION_FALLBACK_BACKEND"]
+
+    assert expression == (
+        "${{ vars.GENERATION_FALLBACK_BACKEND || "
+        "secrets.GENERATION_FALLBACK_BACKEND || 'litellm' }}"
+    )
 
 
 def test_env_example_includes_provider_template_channel_examples() -> None:

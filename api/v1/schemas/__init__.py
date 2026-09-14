@@ -14,11 +14,22 @@ from api.v1.schemas.common import (
     ErrorResponse,
     SuccessResponse,
 )
+from api.v1.schemas.market_phase import MarketPhaseSummary
+from api.v1.schemas.research_artifact import (
+    ResearchArtifact,
+    ResearchDataQuality,
+    ResearchEvidenceItem,
+    ResearchInvalidationCondition,
+    ResearchNextAction,
+    ResearchSubject,
+    ResearchThesis,
+)
 from api.v1.schemas.analysis import (
     AnalyzeRequest,
     AnalysisResultResponse,
     TaskAccepted,
     BatchTaskAcceptedResponse,
+    RejectedTaskItem,
     TaskStatus,
 )
 from api.v1.schemas.history import (
@@ -38,6 +49,7 @@ from api.v1.schemas.stocks import (
     StockQuote,
     StockHistoryResponse,
     KLineData,
+    StockProfileResponse,
 )
 from api.v1.schemas.backtest import (
     BacktestRunRequest,
@@ -45,6 +57,14 @@ from api.v1.schemas.backtest import (
     BacktestResultItem,
     BacktestResultsResponse,
     PerformanceMetrics,
+)
+from api.v1.schemas.data_capability import (
+    DataCapabilityOverviewResponse,
+    DataDatasetQuality,
+    DataPriorityView,
+    DataProviderCapability,
+    DatasetQualityStatus,
+    ProviderCapabilityStatus,
 )
 from api.v1.schemas.system_config import (
     SystemConfigFieldSchema,
@@ -82,6 +102,7 @@ from api.v1.schemas.portfolio import (
     PortfolioCashLedgerListResponse,
     PortfolioCorporateActionListItem,
     PortfolioCorporateActionListResponse,
+    PortfolioPositionAnalysisRequest,
     PortfolioPositionItem,
     PortfolioAccountSnapshot,
     PortfolioSnapshotResponse,
@@ -91,6 +112,8 @@ from api.v1.schemas.portfolio import (
     PortfolioImportBrokerItem,
     PortfolioImportBrokerListResponse,
     PortfolioFxRefreshResponse,
+    PortfolioDecisionSignalRiskBlock,
+    PortfolioDecisionSignalRiskItem,
     PortfolioRiskResponse,
 )
 from api.v1.schemas.alerts import (
@@ -105,6 +128,25 @@ from api.v1.schemas.alerts import (
     AlertTriggerItem,
     AlertTriggerListResponse,
 )
+from api.v1.schemas.decision_signals import (
+    DecisionProfile,
+    DecisionSignalCreateRequest,
+    DecisionSignalFeedbackItem,
+    DecisionSignalFeedbackRequest,
+    DecisionSignalItem,
+    DecisionSignalListResponse,
+    DecisionSignalMutationResponse,
+    DecisionSignalOutcomeItem,
+    DecisionSignalOutcomeListResponse,
+    DecisionSignalOutcomeRunRequest,
+    DecisionSignalOutcomeRunResponse,
+    DecisionSignalOutcomeStatsBucket,
+    DecisionSignalOutcomeStatsResponse,
+    DecisionSignalProfileCalibration,
+    DecisionSignalProfileCalibrationBreakdowns,
+    DecisionSignalProfileCalibrationBucket,
+    DecisionSignalStatusUpdateRequest,
+)
 
 __all__ = [
     # common
@@ -112,11 +154,22 @@ __all__ = [
     "HealthResponse",
     "ErrorResponse",
     "SuccessResponse",
+    # market phase
+    "MarketPhaseSummary",
+    # research artifact
+    "ResearchArtifact",
+    "ResearchDataQuality",
+    "ResearchEvidenceItem",
+    "ResearchInvalidationCondition",
+    "ResearchNextAction",
+    "ResearchSubject",
+    "ResearchThesis",
     # analysis
     "AnalyzeRequest",
     "AnalysisResultResponse",
     "TaskAccepted",
     "BatchTaskAcceptedResponse",
+    "RejectedTaskItem",
     "TaskStatus",
     # history
     "HistoryItem",
@@ -134,12 +187,20 @@ __all__ = [
     "StockQuote",
     "StockHistoryResponse",
     "KLineData",
+    "StockProfileResponse",
     # backtest
     "BacktestRunRequest",
     "BacktestRunResponse",
     "BacktestResultItem",
     "BacktestResultsResponse",
     "PerformanceMetrics",
+    # data capability
+    "DataCapabilityOverviewResponse",
+    "DataDatasetQuality",
+    "DataPriorityView",
+    "DataProviderCapability",
+    "DatasetQualityStatus",
+    "ProviderCapabilityStatus",
     # system config
     "SystemConfigFieldSchema",
     "SystemConfigCategorySchema",
@@ -175,6 +236,7 @@ __all__ = [
     "PortfolioCashLedgerListResponse",
     "PortfolioCorporateActionListItem",
     "PortfolioCorporateActionListResponse",
+    "PortfolioPositionAnalysisRequest",
     "PortfolioPositionItem",
     "PortfolioAccountSnapshot",
     "PortfolioSnapshotResponse",
@@ -184,6 +246,8 @@ __all__ = [
     "PortfolioImportBrokerItem",
     "PortfolioImportBrokerListResponse",
     "PortfolioFxRefreshResponse",
+    "PortfolioDecisionSignalRiskBlock",
+    "PortfolioDecisionSignalRiskItem",
     "PortfolioRiskResponse",
     # alerts
     "AlertDeleteResponse",
@@ -196,4 +260,22 @@ __all__ = [
     "AlertRuleUpdateRequest",
     "AlertTriggerItem",
     "AlertTriggerListResponse",
+    # decision signals
+    "DecisionProfile",
+    "DecisionSignalCreateRequest",
+    "DecisionSignalFeedbackItem",
+    "DecisionSignalFeedbackRequest",
+    "DecisionSignalItem",
+    "DecisionSignalListResponse",
+    "DecisionSignalMutationResponse",
+    "DecisionSignalOutcomeItem",
+    "DecisionSignalOutcomeListResponse",
+    "DecisionSignalOutcomeRunRequest",
+    "DecisionSignalOutcomeRunResponse",
+    "DecisionSignalOutcomeStatsBucket",
+    "DecisionSignalOutcomeStatsResponse",
+    "DecisionSignalProfileCalibration",
+    "DecisionSignalProfileCalibrationBreakdowns",
+    "DecisionSignalProfileCalibrationBucket",
+    "DecisionSignalStatusUpdateRequest",
 ]

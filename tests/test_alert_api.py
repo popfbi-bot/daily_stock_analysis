@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import src.auth as auth
 from api.app import create_app
 from src.config import Config
 from src.repositories.alert_repo import AlertRepository
+from src.services.alert_service import AlertService
 from src.services.portfolio_service import PortfolioService
 from src.storage import AlertCooldownRecord, AlertNotificationRecord, AlertTriggerRecord, Base, DatabaseManager
 
@@ -245,6 +247,19 @@ class AlertApiTestCase(unittest.TestCase):
         self.assertEqual(payload["total"], 1)
         self.assertEqual(payload["items"][0]["target"], "300750")
         self.assertEqual(payload["items"][0]["parameters"]["change_pct"], 3.5)
+
+    def test_single_symbol_filter_is_case_insensitive_for_legacy_targets(self) -> None:
+        created = self._create_rule({"target": "Brk.B"})
+
+        resp = self.client.get(
+            "/api/v1/alerts/rules",
+            params={"target_scope": "single_symbol", "target": "BRK.B"},
+        )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["total"], 1)
+        self.assertEqual(resp.json()["items"][0]["id"], created["id"])
+        self.assertEqual(resp.json()["items"][0]["target"], "Brk.B")
 
     def test_create_p5_technical_indicator_rules(self) -> None:
         cases = [
@@ -529,6 +544,21 @@ class AlertApiTestCase(unittest.TestCase):
         self.assertEqual(invalid_target.status_code, 400, invalid_target.text)
         self.assertEqual(invalid_target.json()["error"], "validation_error")
 
+        for market in ("jp", "kr"):
+            with self.subTest(market=market):
+                unsupported_market = self.client.post(
+                    "/api/v1/alerts/rules",
+                    json={
+                        "target_scope": "market",
+                        "target": market,
+                        "alert_type": "market_light_status",
+                        "parameters": {"statuses": ["red"]},
+                    },
+                )
+                self.assertEqual(unsupported_market.status_code, 400, unsupported_market.text)
+                self.assertEqual(unsupported_market.json()["error"], "validation_error")
+                self.assertIn("cn, hk, us", unsupported_market.json()["message"])
+
     def test_dry_run_market_light_rule_uses_snapshot_and_does_not_write_history(self) -> None:
         rule = self._create_rule({
             "name": "Market risk-off",
@@ -554,9 +584,12 @@ class AlertApiTestCase(unittest.TestCase):
             "data_quality": "ok",
         }
 
+        async def _run_inline(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
         with patch("src.services.market_light_alerts.get_open_markets_today", return_value={"cn"}), patch(
             "src.services.market_light_alerts.build_current_snapshot", return_value=snapshot
-        ) as build_snapshot:
+        ) as build_snapshot, patch("src.services.alert_service.asyncio.to_thread", new=_run_inline):
             resp = self.client.post(f"/api/v1/alerts/rules/{rule['id']}/test")
 
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -811,6 +844,9 @@ class AlertApiTestCase(unittest.TestCase):
         self.assertEqual(trigger_payload["total"], 1)
         self.assertNotIn("secret-token", str(trigger_payload))
         self.assertNotIn("example.com/hook", str(trigger_payload))
+        self.assertIsNone(trigger_payload["items"][0]["market_phase_summary"])
+        self.assertIsNone(trigger_payload["items"][0]["analysis_context_pack_overview"])
+        self.assertEqual(trigger_payload["items"][0]["analysis_visibility_source"], "legacy_text")
 
         notification_resp = self.client.get("/api/v1/alerts/notifications", params={"channel": "wechat"})
         self.assertEqual(notification_resp.status_code, 200)
@@ -819,6 +855,57 @@ class AlertApiTestCase(unittest.TestCase):
         self.assertTrue(notification_payload["items"][0]["retryable"])
         self.assertNotIn("secret-token", str(notification_payload))
         self.assertNotIn("example.com/webhook", str(notification_payload))
+
+    def test_trigger_query_derives_analysis_visibility_from_json_diagnostics(self) -> None:
+        rule = self._create_rule()
+        diagnostics = {
+            "existing": "keep",
+            "analysis_visibility": {
+                "source": "analysis_history_snapshot",
+                "market_phase_summary": {
+                    "phase": "postmarket",
+                    "market": "cn",
+                    "trigger_source": "alert",
+                    "is_partial_bar": False,
+                },
+                "analysis_context_pack_overview": {
+                    "pack_version": "1.0",
+                    "subject": {"code": "600519", "market": "cn"},
+                    "data_quality": {
+                        "overall_score": 88,
+                        "level": "good",
+                        "limitations": ["news: missing"],
+                    },
+                    "blocks": [
+                        {"key": "quote", "label": "行情", "status": "available"},
+                        {"key": "news", "label": "新闻", "status": "missing"},
+                    ],
+                },
+            },
+        }
+        with self.db.get_session() as session:
+            session.add(
+                AlertTriggerRecord(
+                    rule_id=rule["id"],
+                    target="600519",
+                    observed_value=1810.0,
+                    threshold=1800.0,
+                    reason="breakout",
+                    data_source="unit-test",
+                    triggered_at=datetime(2026, 1, 1, 9, 30),
+                    status="triggered",
+                    diagnostics=json.dumps(diagnostics),
+                )
+            )
+            session.commit()
+
+        resp = self.client.get("/api/v1/alerts/triggers", params={"page": 1, "page_size": 10})
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        item = resp.json()["items"][0]
+        self.assertEqual(item["analysis_visibility_source"], "analysis_history_snapshot")
+        self.assertEqual(item["market_phase_summary"]["phase"], "postmarket")
+        self.assertEqual(item["analysis_context_pack_overview"]["data_quality"]["level"], "good")
 
     def test_alert_cooldowns_table_create_all_is_idempotent(self) -> None:
         constraint_names = {constraint.name for constraint in AlertCooldownRecord.__table__.constraints}

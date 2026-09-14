@@ -16,11 +16,10 @@ from contextlib import contextmanager
 import hashlib
 import json
 import logging
-import re
 import threading
 import time
-from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar
+from datetime import datetime, date, timedelta, timezone
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar, Union
 
 import pandas as pd
 from sqlalchemy import (
@@ -35,7 +34,9 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     UniqueConstraint,
+    CheckConstraint,
     Text,
+    text,
     select,
     and_,
     or_,
@@ -43,6 +44,9 @@ from sqlalchemy import (
     desc,
     event,
     func,
+    inspect,
+    MetaData,
+    Table,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import (
@@ -54,9 +58,13 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from src.agent.provider_trace import PROVIDER_TRACE_RETENTION_LIMIT
 from src.config import get_config
+from src.schemas.decision_profile import extract_legacy_decision_profile
+from src.utils.sniper_points import extract_sniper_points, parse_sniper_value
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
+INTELLIGENCE_ITEM_NULL_SCOPE_VALUE = "__dsa_null_scope__"
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -65,7 +73,29 @@ if TYPE_CHECKING:
     from src.search_service import SearchResponse
 
 
+def utc_naive_now() -> datetime:
+    """Return current UTC time without tzinfo for SQLite DateTime columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def to_utc_naive_datetime(value: datetime) -> datetime:
+    """Normalize aware datetimes to UTC-naive; treat naive values as UTC-naive."""
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 # === 数据模型定义 ===
+
+class DatabaseSchemaMigration(Base):
+    """Applied database schema version marker."""
+
+    __tablename__ = 'schema_migrations'
+
+    version = Column(String(64), primary_key=True)
+    description = Column(String(255), nullable=False)
+    applied_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
 
 class StockDaily(Base):
     """
@@ -104,15 +134,23 @@ class StockDaily(Base):
     
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
-    
+
+    # canonical_id：Phase 1 前缀格式的稳定分析目标键（如 sh000300 / sh600519 / AAPL）。
+    # Expand-Contract PR2：仅加列 + 双写，读路径仍用 ``code`` 列；PR3/PR4 再切读路径。
+    # 可空：存量行由自愈式迁移 backfill；新写由 ``save_daily_data`` 推导或显式传入。
+    # 普通索引（非唯一）：历史别名行可能共享同一 canonical_id + date，唯一索引会撞。
+    canonical_id = Column(String(32), nullable=True)
+
     # 更新时间
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    
+
     # 唯一约束：同一股票同一日期只能有一条数据
     __table_args__ = (
         UniqueConstraint('code', 'date', name='uix_code_date'),
         Index('ix_code_date', 'code', 'date'),
+        # 普通索引：允许历史别名行（同 canonical_id + date）共存（AC 9）。
+        Index('ix_stock_daily_canonical_id', 'canonical_id'),
     )
     
     def __repr__(self):
@@ -135,6 +173,7 @@ class StockDaily(Base):
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
             'data_source': self.data_source,
+            'canonical_id': self.canonical_id,
         }
 
 
@@ -186,6 +225,65 @@ class NewsIntel(Base):
         return f"<NewsIntel(code={self.code}, title={self.title[:20]}...)>"
 
 
+class IntelligenceSource(Base):
+    """可配置资讯源。"""
+
+    __tablename__ = 'intelligence_sources'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False, unique=True, index=True)
+    source_type = Column(String(32), nullable=False, default='rss', index=True)
+    url = Column(String(1000), nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    scope_type = Column(String(32), nullable=False, default='market', index=True)
+    scope_value = Column(String(64), index=True)
+    market = Column(String(32), nullable=False, default='cn', index=True)
+    description = Column(Text)
+    last_status = Column(String(32))
+    last_error = Column(Text)
+    last_fetched_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_intel_source_scope', 'scope_type', 'scope_value', 'market'),
+    )
+
+
+class IntelligenceItem(Base):
+    """沉淀后的资讯 / 情报条目。"""
+
+    __tablename__ = 'intelligence_items'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_id = Column(Integer, ForeignKey('intelligence_sources.id', ondelete='SET NULL'), nullable=True, index=True)
+    source_name = Column(String(100), index=True)
+    source_type = Column(String(32), nullable=False, default='rss', index=True)
+    title = Column(String(300), nullable=False)
+    summary = Column(Text)
+    url = Column(String(1000), nullable=False, index=True)
+    source = Column(String(100))
+    published_at = Column(DateTime, index=True)
+    fetched_at = Column(DateTime, default=datetime.now, index=True)
+    scope_type = Column(String(32), nullable=False, default='market', index=True)
+    scope_value = Column(String(64), nullable=False, default=INTELLIGENCE_ITEM_NULL_SCOPE_VALUE, index=True)
+    market = Column(String(32), nullable=False, default='cn', index=True)
+    raw_payload = Column(Text)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'source_id',
+            'url',
+            'scope_type',
+            'scope_value',
+            'market',
+            name='uix_intel_item_source_scope_url',
+        ),
+        Index('ix_intel_item_scope_time', 'scope_type', 'scope_value', 'market', 'published_at'),
+        Index('ix_intel_item_fetch_time', 'fetched_at'),
+    )
+
+
 class FundamentalSnapshot(Base):
     """
     基本面上下文快照（P0 write-only）。
@@ -209,6 +307,32 @@ class FundamentalSnapshot(Base):
 
     def __repr__(self) -> str:
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
+
+
+class ScreeningRun(Base):
+    """A completed built-in screening run persisted by DSA."""
+
+    __tablename__ = 'screening_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    strategy = Column(String(64), nullable=False, index=True)
+    market = Column(String(16), nullable=False, index=True)
+    snapshot_source = Column(String(64), index=True)
+    snapshot_count = Column(Integer)
+    after_filter_count = Column(Integer)
+    candidate_count = Column(Integer, nullable=False, default=0)
+    llm_ranked = Column(Boolean)
+    daily_enriched = Column(Boolean)
+    source_errors_json = Column(Text)
+    warnings_json = Column(Text)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_screening_run_strategy_created', 'strategy', 'created_at'),
+        Index('ix_screening_run_market_created', 'market', 'created_at'),
+    )
 
 
 class AnalysisHistory(Base):
@@ -610,6 +734,17 @@ class ConversationMessage(Base):
     created_at = Column(DateTime, default=datetime.now, index=True)
 
 
+class ConversationSessionState(Base):
+    """Persisted user selections for an Agent chat session."""
+
+    __tablename__ = 'conversation_session_states'
+
+    session_id = Column(String(100), primary_key=True)
+    selected_skill_ids_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+
 class ConversationSummary(Base):
     """Rolling summary for visible Agent chat history."""
 
@@ -660,10 +795,140 @@ class LLMUsage(Base):
     call_type = Column(String(32), nullable=False, index=True)
     model = Column(String(128), nullable=False)
     stock_code = Column(String(16), nullable=True)
+    provider = Column(String(64), nullable=True)
     prompt_tokens = Column(Integer, nullable=False, default=0)
     completion_tokens = Column(Integer, nullable=False, default=0)
     total_tokens = Column(Integer, nullable=False, default=0)
+
+    # Sanitized provider usage snapshot; raw prompts, messages, headers, and
+    # tokenizer free-text fields are intentionally not persisted here.
+    provider_usage_json = Column(Text, nullable=True)
+    provider_usage_schema_name = Column(String(64), nullable=True)
+    provider_usage_schema_version = Column(String(32), nullable=True)
+    provider_usage_observed_at = Column(String(32), nullable=True)
+
+    # Normalized telemetry values are derived from provider usage and may stay
+    # NULL when the provider payload is absent or explicitly invalid.
+    normalized_prompt_tokens = Column(Integer, nullable=True)
+    normalized_completion_tokens = Column(Integer, nullable=True)
+    normalized_total_tokens = Column(Integer, nullable=True)
+    normalized_cache_read_tokens = Column(Integer, nullable=True)
+    normalized_cache_write_tokens = Column(Integer, nullable=True)
+    normalized_cache_miss_tokens = Column(Integer, nullable=True)
+    normalized_uncached_input_tokens = Column(Integer, nullable=True)
+    normalized_cache_eligible_input_tokens = Column(Integer, nullable=True)
+    normalized_cache_hit_ratio = Column(Float, nullable=True)
+    normalized_cache_write_ratio = Column(Float, nullable=True)
+    cache_capability = Column(String(32), nullable=True)
+    cache_eligibility = Column(String(32), nullable=True)
+    cache_observation = Column(String(32), nullable=True)
+    estimated_prefix_tokens = Column(Integer, nullable=True)
+    provider_reported_prompt_tokens = Column(Integer, nullable=True)
+    provider_reported_cached_tokens = Column(Integer, nullable=True)
+    provider_min_cache_tokens = Column(Integer, nullable=True)
+    eligibility_confidence = Column(String(32), nullable=True)
+
+    # Kept nullable for schema compatibility; new writes do not store provider
+    # or proxy tokenizer free-text values.
+    tokenizer_name = Column(String(128), nullable=True)
+    tokenizer_version = Column(String(64), nullable=True)
+
+    # HMAC fingerprints let deployments compare message shapes without storing
+    # raw prompt/message content.
+    messages_hmac = Column(String(64), nullable=True)
+    system_message_hmac = Column(String(64), nullable=True)
+    user_message_hmac = Column(String(64), nullable=True)
+    hmac_key_version = Column(String(64), nullable=True)
+    hmac_domain = Column(String(32), nullable=True)
+    hash_scope = Column(String(32), nullable=True)
+
+    # P0.5a internal legacy message stability audit. These diagnostics are
+    # stored locally only and are not returned by public usage APIs.
+    language = Column(String(16), nullable=True)
+    market_group = Column(String(16), nullable=True)
+    analysis_mode = Column(String(64), nullable=True)
+    legacy_prompt_mode = Column(String(32), nullable=True)
+    skill_config_hmac = Column(String(64), nullable=True)
+    transport = Column(String(64), nullable=True)
+    message_count = Column(Integer, nullable=True)
+    estimated_total_prompt_tokens = Column(Integer, nullable=True)
+    approx_common_prefix_chars = Column(Integer, nullable=True)
+    approx_common_prefix_tokens = Column(Integer, nullable=True)
+    known_dynamic_marker_positions = Column(Text, nullable=True)
     called_at = Column(DateTime, default=datetime.now, index=True)
+
+
+_LLM_USAGE_TELEMETRY_COLUMN_SQL: Dict[str, str] = {
+    "provider_usage_json": "TEXT",
+    "provider": "VARCHAR(64)",
+    "provider_usage_schema_name": "VARCHAR(64)",
+    "provider_usage_schema_version": "VARCHAR(32)",
+    "provider_usage_observed_at": "VARCHAR(32)",
+    "normalized_prompt_tokens": "INTEGER",
+    "normalized_completion_tokens": "INTEGER",
+    "normalized_total_tokens": "INTEGER",
+    "normalized_cache_read_tokens": "INTEGER",
+    "normalized_cache_write_tokens": "INTEGER",
+    "normalized_cache_miss_tokens": "INTEGER",
+    "normalized_uncached_input_tokens": "INTEGER",
+    "normalized_cache_eligible_input_tokens": "INTEGER",
+    "normalized_cache_hit_ratio": "FLOAT",
+    "normalized_cache_write_ratio": "FLOAT",
+    "cache_capability": "VARCHAR(32)",
+    "cache_eligibility": "VARCHAR(32)",
+    "cache_observation": "VARCHAR(32)",
+    "estimated_prefix_tokens": "INTEGER",
+    "provider_reported_prompt_tokens": "INTEGER",
+    "provider_reported_cached_tokens": "INTEGER",
+    "provider_min_cache_tokens": "INTEGER",
+    "eligibility_confidence": "VARCHAR(32)",
+    "tokenizer_name": "VARCHAR(128)",
+    "tokenizer_version": "VARCHAR(64)",
+    "messages_hmac": "VARCHAR(64)",
+    "system_message_hmac": "VARCHAR(64)",
+    "user_message_hmac": "VARCHAR(64)",
+    "hmac_key_version": "VARCHAR(64)",
+    "hmac_domain": "VARCHAR(32)",
+    "hash_scope": "VARCHAR(32)",
+    "language": "VARCHAR(16)",
+    "market_group": "VARCHAR(16)",
+    "analysis_mode": "VARCHAR(64)",
+    "legacy_prompt_mode": "VARCHAR(32)",
+    "skill_config_hmac": "VARCHAR(64)",
+    "transport": "VARCHAR(64)",
+    "message_count": "INTEGER",
+    "estimated_total_prompt_tokens": "INTEGER",
+    "approx_common_prefix_chars": "INTEGER",
+    "approx_common_prefix_tokens": "INTEGER",
+    "known_dynamic_marker_positions": "TEXT",
+}
+_LLM_USAGE_INTEGER_TELEMETRY_COLUMNS = {
+    column
+    for column, column_type in _LLM_USAGE_TELEMETRY_COLUMN_SQL.items()
+    if column_type == "INTEGER"
+}
+_LLM_USAGE_DROPPED_FREE_TEXT_COLUMNS = {"tokenizer_name", "tokenizer_version"}
+_LLM_PROMPT_CACHE_TELEMETRY_DISABLED_ATTR = "prompt_cache_telemetry_disabled"
+_LLM_PROMPT_CACHE_TELEMETRY_COLUMNS = {
+    "provider_usage_json",
+    "provider_usage_schema_name",
+    "provider_usage_schema_version",
+    "provider_usage_observed_at",
+    "normalized_cache_read_tokens",
+    "normalized_cache_write_tokens",
+    "normalized_cache_miss_tokens",
+    "normalized_uncached_input_tokens",
+    "normalized_cache_eligible_input_tokens",
+    "normalized_cache_hit_ratio",
+    "normalized_cache_write_ratio",
+    "cache_capability",
+    "cache_eligibility",
+    "cache_observation",
+    "estimated_prefix_tokens",
+    "provider_reported_cached_tokens",
+    "provider_min_cache_tokens",
+    "eligibility_confidence",
+}
 
 
 class AlertRuleRecord(Base):
@@ -763,6 +1028,277 @@ class AlertCooldownRecord(Base):
     )
 
 
+class DecisionSignalRecord(Base):
+    """Persisted AI decision signal asset for Issue #1390 P1."""
+
+    __tablename__ = 'decision_signals'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    market = Column(String(8), nullable=False, index=True)
+    source_type = Column(String(32), nullable=False, index=True)
+    source_agent = Column(String(64))
+    source_report_id = Column(Integer, index=True)
+    trace_id = Column(String(64), index=True)
+    decision_profile = Column(String(16), index=True)
+    market_phase = Column(String(24), index=True)
+    trigger_source = Column(String(64), nullable=False, index=True)
+    action = Column(String(16), nullable=False, index=True)
+    action_label = Column(String(32))
+    confidence = Column(Float)
+    score = Column(Integer)
+    horizon = Column(String(16), index=True)
+    entry_low = Column(Float)
+    entry_high = Column(Float)
+    stop_loss = Column(Float)
+    target_price = Column(Float)
+    invalidation = Column(Text)
+    watch_conditions = Column(Text)
+    reason = Column(Text)
+    risk_summary = Column(Text)
+    catalyst_summary = Column(Text)
+    evidence_json = Column(Text)
+    data_quality_summary_json = Column(Text)
+    plan_quality = Column(String(16), nullable=False, default='unknown', index=True)
+    status = Column(String(16), nullable=False, default='active', index=True)
+    expires_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+    metadata_json = Column(Text)
+
+    __table_args__ = (
+        Index('ix_decision_signal_stock_status_time', 'stock_code', 'status', 'created_at'),
+        Index('ix_decision_signal_market_status_time', 'market', 'status', 'created_at'),
+        Index(
+            'ix_decision_signal_report_type_market_stock_action_horizon_phase',
+            'source_report_id',
+            'source_type',
+            'market',
+            'stock_code',
+            'action',
+            'horizon',
+            'market_phase',
+        ),
+        Index(
+            'ix_decision_signal_trace_type_market_stock_action_horizon_phase',
+            'trace_id',
+            'source_type',
+            'market',
+            'stock_code',
+            'action',
+            'horizon',
+            'market_phase',
+        ),
+        Index(
+            'ix_decision_signal_report_type_market_stock_profile_action_horizon_phase',
+            'source_report_id',
+            'source_type',
+            'market',
+            'stock_code',
+            'decision_profile',
+            'action',
+            'horizon',
+            'market_phase',
+        ),
+        Index(
+            'ix_decision_signal_trace_type_market_stock_profile_action_horizon_phase',
+            'trace_id',
+            'source_type',
+            'market',
+            'stock_code',
+            'decision_profile',
+            'action',
+            'horizon',
+            'market_phase',
+        ),
+        Index(
+            'ix_decision_signal_market_stock_profile_created',
+            'market',
+            'stock_code',
+            'decision_profile',
+            'created_at',
+        ),
+    )
+
+
+class DecisionSignalOutcomeRecord(Base):
+    """Signal-level forward outcome for Issue #1390 P5."""
+
+    __tablename__ = 'decision_signal_outcomes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id = Column(Integer, nullable=False, index=True)
+    horizon = Column(String(16), nullable=False, index=True)
+    engine_version = Column(String(32), nullable=False, index=True)
+    eval_status = Column(String(24), nullable=False, default='unable', index=True)
+    outcome = Column(String(16), index=True)
+    direction_expected = Column(String(16), index=True)
+    direction_correct = Column(Boolean)
+    unable_reason = Column(String(64), index=True)
+    anchor_date = Column(Date, index=True)
+    eval_window_days = Column(Integer)
+    start_price = Column(Float)
+    end_close = Column(Float)
+    max_high = Column(Float)
+    min_low = Column(Float)
+    stock_return_pct = Column(Float)
+
+    action = Column(String(16), index=True)
+    market = Column(String(8), index=True)
+    market_phase = Column(String(24), index=True)
+    source_type = Column(String(32), index=True)
+    source_agent = Column(String(64), index=True)
+    plan_quality = Column(String(16), index=True)
+    data_quality_level = Column(String(24), index=True)
+    holding_state = Column(String(16), nullable=False, default='unknown', index=True)
+
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('signal_id', 'horizon', 'engine_version', name='uix_decision_signal_outcome_key'),
+        Index('ix_decision_signal_outcome_stats_action', 'engine_version', 'action', 'horizon'),
+        Index('ix_decision_signal_outcome_stats_market', 'engine_version', 'market', 'horizon'),
+    )
+
+
+class DecisionSignalFeedbackRecord(Base):
+    """Latest user feedback for a decision signal."""
+
+    __tablename__ = 'decision_signal_feedback'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id = Column(Integer, nullable=False, unique=True, index=True)
+    feedback_value = Column(String(16), nullable=False, index=True)
+    reason_code = Column(String(64), index=True)
+    note = Column(Text)
+    source = Column(String(16), nullable=False, default='api', index=True)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+
+
+class SkillOpinionSampleRecord(Base):
+    """Immutable, low-sensitivity skill opinion sample for Issue #1904 P2 PR1."""
+
+    __tablename__ = 'skill_opinion_samples'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    analysis_history_id = Column(
+        Integer,
+        ForeignKey('analysis_history.id'),
+        nullable=False,
+        index=True,
+    )
+    stock_code = Column(String(16), nullable=False, index=True)
+    skill_id = Column(String(128), nullable=False, index=True)
+    skill_version = Column(String(64), index=True)
+    signal = Column(String(16), nullable=False, index=True)
+    confidence = Column(Float, nullable=False)
+    horizon = Column(String(16), index=True)
+    data_quality_level = Column(String(24), index=True)
+    opinion_created_at = Column(DateTime, index=True)
+    sample_schema_version = Column(String(32), nullable=False, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'analysis_history_id',
+            'skill_id',
+            'sample_schema_version',
+            name='uix_skill_opinion_sample_key',
+        ),
+        Index(
+            'ix_skill_opinion_sample_skill_horizon_created',
+            'skill_id',
+            'horizon',
+            'created_at',
+        ),
+        Index(
+            'ix_skill_opinion_sample_stock_created',
+            'stock_code',
+            'created_at',
+        ),
+    )
+
+
+class SkillOpinionOutcomeRecord(Base):
+    """Forward outcome for one immutable skill opinion sample and horizon."""
+
+    __tablename__ = 'skill_opinion_outcomes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_opinion_sample_id = Column(
+        Integer,
+        ForeignKey('skill_opinion_samples.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    horizon = Column(String(16), nullable=False, index=True)
+    engine_version = Column(String(32), nullable=False, index=True)
+    eval_status = Column(String(24), nullable=False, default='pending', index=True)
+    outcome = Column(String(16), index=True)
+    direction_correct = Column(Boolean)
+    unable_reason = Column(String(64), index=True)
+    analysis_date = Column(Date, index=True)
+    start_trade_date = Column(Date, index=True)
+    end_trade_date = Column(Date, index=True)
+    start_price = Column(Float)
+    end_close = Column(Float)
+    stock_return_pct = Column(Float)
+    directional_return_pct = Column(Float)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'skill_opinion_sample_id',
+            'horizon',
+            'engine_version',
+            name='uix_skill_opinion_outcome_key',
+        ),
+        CheckConstraint(
+            "horizon IN ('1d', '3d', '5d', '10d')",
+            name='ck_skill_opinion_outcome_horizon',
+        ),
+        CheckConstraint(
+            "eval_status IN ('pending', 'evaluated', 'observational', 'unable')",
+            name='ck_skill_opinion_outcome_eval_status',
+        ),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('hit', 'miss', 'observational')",
+            name='ck_skill_opinion_outcome_value',
+        ),
+        CheckConstraint(
+            "(eval_status IN ('pending', 'unable') "
+            "AND outcome IS NULL "
+            "AND direction_correct IS NULL "
+            "AND directional_return_pct IS NULL) "
+            "OR (eval_status = 'observational' "
+            "AND outcome = 'observational' "
+            "AND direction_correct IS NULL "
+            "AND directional_return_pct IS NULL) "
+            "OR (eval_status = 'evaluated' "
+            "AND outcome IN ('hit', 'miss') "
+            "AND direction_correct IS NOT NULL "
+            "AND directional_return_pct IS NOT NULL)",
+            name='ck_skill_opinion_outcome_state_fields',
+        ),
+        Index(
+            'ix_skill_opinion_outcome_candidate',
+            'engine_version',
+            'eval_status',
+            'updated_at',
+        ),
+        Index(
+            'ix_skill_opinion_outcome_horizon_status',
+            'engine_version',
+            'horizon',
+            'eval_status',
+        ),
+    )
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -843,6 +1379,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
             # 创建所有表
             Base.metadata.create_all(self._engine)
+            self._ensure_llm_usage_telemetry_columns()
+            self._ensure_decision_signal_profile_schema()
+            self._ensure_stock_daily_canonical_id()
+            self._ensure_intelligence_item_scope_values()
+            self._ensure_schema_migration_record()
+            self._ensure_intelligence_items_unique_index()
 
             self._initialized = True
             logger.info(f"数据库初始化完成: {db_url}")
@@ -860,6 +1402,746 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._SessionLocal = None
             self.__class__._instance = None
             raise
+
+    def _ensure_schema_migration_record(self) -> None:
+        session = self._SessionLocal()
+        values = {
+            "version": CURRENT_SCHEMA_VERSION,
+            "description": "Baseline schema created through SQLAlchemy metadata.create_all",
+        }
+        try:
+            if self._is_sqlite_engine:
+                statement = sqlite_insert(DatabaseSchemaMigration).values(**values)
+                statement = statement.on_conflict_do_nothing(index_elements=["version"])
+                session.execute(statement)
+            else:
+                session.execute(DatabaseSchemaMigration.__table__.insert().values(**values))
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            with self._SessionLocal() as verify_session:
+                existing = verify_session.get(DatabaseSchemaMigration, CURRENT_SCHEMA_VERSION)
+            if existing is None:
+                raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _ensure_decision_signal_profile_schema(self) -> None:
+        """Add and backfill nullable decision_profile for existing SQLite DBs."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(DecisionSignalRecord.__tablename__):
+            return
+
+        try:
+            existing = {
+                column["name"]
+                for column in inspector.get_columns(DecisionSignalRecord.__tablename__)
+            }
+        except Exception as exc:
+            logger.error(
+                "[DecisionSignal] failed to inspect decision_profile column; "
+                "profile migration cannot continue safely: %s",
+                exc,
+            )
+            raise
+
+        if "decision_profile" not in existing:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {DecisionSignalRecord.__tablename__} "
+                        "ADD COLUMN decision_profile VARCHAR(16)"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, "decision_profile"):
+                    raise
+
+        self._ensure_decision_signal_profile_indexes()
+        self._backfill_decision_signal_profile_from_metadata()
+
+    def _ensure_decision_signal_profile_indexes(self) -> None:
+        """Create profile-aware indexes without dropping legacy indexes."""
+
+        expected_indexes = {
+            "ix_decision_signals_decision_profile": ["decision_profile"],
+            "ix_decision_signal_market_stock_profile_created": [
+                "market", "stock_code", "decision_profile", "created_at",
+            ],
+            "ix_decision_signal_report_type_market_stock_profile_action_horizon_phase": [
+                "source_report_id", "source_type", "market", "stock_code",
+                "decision_profile", "action", "horizon", "market_phase",
+            ],
+            "ix_decision_signal_trace_type_market_stock_profile_action_horizon_phase": [
+                "trace_id", "source_type", "market", "stock_code",
+                "decision_profile", "action", "horizon", "market_phase",
+            ],
+        }
+        with self._engine.begin() as connection:
+            for index_name, columns in expected_indexes.items():
+                connection.exec_driver_sql(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON decision_signals ({', '.join(columns)})"
+                )
+
+        actual_indexes = {
+            index["name"]: index["column_names"]
+            for index in inspect(self._engine).get_indexes(
+                DecisionSignalRecord.__tablename__
+            )
+        }
+        for index_name, expected_columns in expected_indexes.items():
+            if actual_indexes.get(index_name) != expected_columns:
+                raise RuntimeError(
+                    "decision_profile index verification failed: "
+                    f"index={index_name} expected={expected_columns} "
+                    f"actual={actual_indexes.get(index_name)}"
+                )
+
+    def _backfill_decision_signal_profile_from_metadata(self) -> None:
+        stats = {
+            "candidate_count": 0,
+            "backfilled_count": 0,
+            "guard_skipped_count": 0,
+            "missing_metadata_count": 0,
+            "missing_profile_count": 0,
+            "invalid_json_count": 0,
+            "non_object_count": 0,
+            "invalid_profile_count": 0,
+            "skipped_existing_profile_count": 0,
+        }
+        with self._engine.begin() as connection:
+            stats["skipped_existing_profile_count"] = connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM decision_signals "
+                    "WHERE decision_profile IS NOT NULL"
+                )
+            ).scalar_one()
+            candidate_rows = [
+                (row["id"], row["metadata_json"])
+                for row in connection.execute(
+                    text(
+                        "SELECT id, metadata_json FROM decision_signals "
+                        "WHERE decision_profile IS NULL ORDER BY id"
+                    )
+                ).mappings()
+            ]
+            stats["candidate_count"] = len(candidate_rows)
+
+            for signal_id, metadata_json in candidate_rows:
+                if metadata_json is None:
+                    stats["missing_metadata_count"] += 1
+                    continue
+                try:
+                    metadata = json.loads(metadata_json)
+                except (TypeError, ValueError, RecursionError):
+                    stats["invalid_json_count"] += 1
+                    continue
+                if not isinstance(metadata, dict):
+                    stats["non_object_count"] += 1
+                    continue
+
+                raw_profile = metadata.get("decision_profile")
+                if raw_profile is None or (
+                    isinstance(raw_profile, str) and not raw_profile.strip()
+                ):
+                    stats["missing_profile_count"] += 1
+                    continue
+                profile = extract_legacy_decision_profile(metadata)
+                if profile is None:
+                    stats["invalid_profile_count"] += 1
+                    continue
+
+                result = connection.execute(
+                    text(
+                        "UPDATE decision_signals "
+                        "SET decision_profile = :decision_profile "
+                        "WHERE id = :signal_id AND decision_profile IS NULL"
+                    ),
+                    {"decision_profile": profile, "signal_id": signal_id},
+                )
+                if result.rowcount == 1:
+                    stats["backfilled_count"] += 1
+                elif result.rowcount == 0:
+                    stats["guard_skipped_count"] += 1
+                else:
+                    raise RuntimeError(
+                        "decision_profile backfill updated an unexpected number "
+                        f"of rows for signal_id={signal_id}: {result.rowcount}"
+                    )
+
+            classified_count = sum(
+                stats[key]
+                for key in (
+                    "backfilled_count",
+                    "guard_skipped_count",
+                    "missing_metadata_count",
+                    "missing_profile_count",
+                    "invalid_json_count",
+                    "non_object_count",
+                    "invalid_profile_count",
+                )
+            )
+            if classified_count != stats["candidate_count"]:
+                raise RuntimeError(
+                    "decision_profile migration stats did not classify every "
+                    f"candidate: candidates={stats['candidate_count']} "
+                    f"classified={classified_count}"
+                )
+        logger.info(
+            "[DecisionSignal] decision_profile migration stats: "
+            "candidate_count=%s backfilled_count=%s guard_skipped_count=%s "
+            "missing_metadata_count=%s missing_profile_count=%s "
+            "invalid_json_count=%s non_object_count=%s invalid_profile_count=%s "
+            "skipped_existing_profile_count=%s",
+            stats["candidate_count"],
+            stats["backfilled_count"],
+            stats["guard_skipped_count"],
+            stats["missing_metadata_count"],
+            stats["missing_profile_count"],
+            stats["invalid_json_count"],
+            stats["non_object_count"],
+            stats["invalid_profile_count"],
+            stats["skipped_existing_profile_count"],
+        )
+
+    def _ensure_stock_daily_canonical_id(self) -> None:
+        """Self-healing migration: add + backfill the ``canonical_id`` column.
+
+        Expand-Contract PR2 (issue #2207). Mirrors the
+        ``_ensure_decision_signal_profile_schema`` 6-step pattern:
+
+        1. SQLite-only (non-SQLite engines rely on ``Base.metadata.create_all``).
+        2. inspect() whether the ``stock_daily`` table exists at all.
+        3. inspect() whether the ``canonical_id`` column already exists (idempotent).
+        4. ``ALTER TABLE ... ADD COLUMN canonical_id VARCHAR(32)`` (nullable —
+           SQLite can't add NOT NULL/UNIQUE columns via ALTER).
+         5. Backfill existing rows with ``_derive_canonical_id(code)`` in
+            id-batched chunks (5000/batch), using ``WHERE canonical_id IS NULL``
+            so re-runs are safe. ``_derive_canonical_id`` mirrors the parser
+            contract: a bare code always derives the stock-path
+            canonical_id (e.g. ``000300`` -> ``sz000300``), while only explicit
+            index forms (``sh000300`` / ``930955.CSI``) derive an index
+            canonical_id. Historical bare rows whose current canonical_id was
+            mis-written as an index identity (e.g. ``sh000300``) are not fixed
+            here — the idempotent ``_backfill_canonical_ids()`` repair corrects
+            that bucket in a separate pass.
+            Function-level lazy import keeps the storage layer free of a
+            circular import on ``src.services.stock_list_parser``.
+        6. Create a plain (non-unique) index ``ix_stock_daily_canonical_id`` so
+           historical alias rows sharing one canonical_id + date can coexist (AC 9).
+
+        The ``(code, date)`` unique constraint ``uix_code_date`` is untouched —
+        read paths keep using the ``code`` column (AC 4).
+        """
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(StockDaily.__tablename__):
+            return
+
+        try:
+            existing = {
+                column["name"]
+                for column in inspector.get_columns(StockDaily.__tablename__)
+            }
+        except Exception as exc:
+            logger.error(
+                "[StockDaily] failed to inspect canonical_id column; "
+                "canonical_id migration cannot continue safely: %s",
+                exc,
+            )
+            raise
+
+        if "canonical_id" not in existing:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {StockDaily.__tablename__} "
+                        "ADD COLUMN canonical_id VARCHAR(32)"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, "canonical_id"):
+                    raise
+
+        self._backfill_stock_daily_canonical_id()
+        self._backfill_canonical_ids()
+        self._ensure_stock_daily_canonical_id_index()
+
+    def _ensure_stock_daily_canonical_id_index(self) -> None:
+        """Create the plain ``ix_stock_daily_canonical_id`` index (idempotent)."""
+
+        with self._engine.begin() as connection:
+            connection.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS ix_stock_daily_canonical_id "
+                f"ON {StockDaily.__tablename__} (canonical_id)"
+            )
+
+        try:
+            actual_indexes = {
+                index["name"]: index["column_names"]
+                for index in inspect(self._engine).get_indexes(
+                    StockDaily.__tablename__
+                )
+            }
+        except Exception as exc:
+            logger.error(
+                "[StockDaily] failed to inspect canonical_id index; "
+                "canonical_id migration cannot verify index safely: %s",
+                exc,
+            )
+            raise
+        if actual_indexes.get("ix_stock_daily_canonical_id") != ["canonical_id"]:
+            raise RuntimeError(
+                "canonical_id index verification failed: "
+                f"index=ix_stock_daily_canonical_id "
+                f"expected=['canonical_id'] "
+                f"actual={actual_indexes.get('ix_stock_daily_canonical_id')}"
+            )
+
+    def _derive_canonical_id(self, code: str) -> Optional[str]:
+        """Derive a Phase 1 ``canonical_id`` for ``code``.
+
+        This method returns ``parse_analysis_target(code).canonical_id`` (or
+        ``None``) and never reads ``matched_index.canonical_id`` to override
+        the result. Bare codes always resolve to the stock-path canonical_id
+        (e.g. bare ``000300`` -> ``sz000300``), while explicit index forms
+        (``sh000300`` / ``930955.CSI``) resolve to their index canonical_id.
+        This keeps the storage derivation consistent with the parser contract
+        (bare = stock, explicit index = index).
+
+        Lazy-imports ``parse_analysis_target`` inside the method (the parser
+        module transitively touches the storage layer) and degrades to
+        ``None`` on import failure or empty canonical_id so callers can
+        persist NULL (D1) without raising.
+        """
+        try:
+            from src.services.stock_list_parser import (
+                ParseStatus,
+                parse_analysis_target,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_derive_canonical_id: cannot import parse_analysis_target "
+                "for code=%r: %s — returning None",
+                code, exc,
+            )
+            return None
+        target = parse_analysis_target(code)
+        if target.asset_type == ParseStatus.UNSUPPORTED:
+            # An unsupported identity (e.g. an unregistered ``csi930956`` /
+            # ``930956.CSI``) must not enter a persistent canonical bucket.
+            # Return None so the caller persists NULL instead.
+            return None
+        return target.canonical_id or None
+
+    def _backfill_stock_daily_canonical_id(self) -> None:
+        """Backfill ``canonical_id`` for existing rows using the Phase 1 parser.
+
+        Idempotent: only rows with ``canonical_id IS NULL`` are considered, and
+        each UPDATE is guarded by the same null condition. Backfilled in
+        id-ordered batches of 5000 so large legacy tables stay within SQLite's
+        per-statement limits.
+
+        The batch scan advances a monotonic ``id`` cursor (not "re-select NULL
+        rows") so a row whose derivation fails can never trap this loop: it is
+        skipped past in this run and naturally retried on next startup while
+        its ``canonical_id`` is still NULL.
+
+        Derivation follows the parser contract: a bare code that collides with
+        an index identity (e.g. ``000300``) backfills to the stock-path
+        canonical_id (``sz000300``); only explicit index forms
+        (``sh000300`` / ``930955.CSI``) derive to an index canonical_id.
+        """
+
+        _BATCH_SIZE = 5000
+        total_backfilled = 0
+        total_skipped = 0
+        last_id = 0
+
+        while True:
+            with self._engine.begin() as connection:
+                rows = connection.execute(
+                    text(
+                        f"SELECT id, code FROM {StockDaily.__tablename__} "
+                        "WHERE canonical_id IS NULL AND id > :last_id "
+                        f"ORDER BY id LIMIT {_BATCH_SIZE}"
+                    ),
+                    {"last_id": last_id},
+                ).fetchall()
+
+            if not rows:
+                break
+
+            with self._engine.begin() as connection:
+                for row_id, code in rows:
+                    # Always advance the cursor — even when this row's
+                    # derivation fails below — so the batch scan terminates.
+                    last_id = row_id
+                    derived = None
+                    try:
+                        derived = self._derive_canonical_id(code)
+                    except Exception as exc:
+                        # D1 decision: parser failure degrades to NULL rather
+                        # than crashing the whole migration. The row keeps
+                        # ``canonical_id IS NULL`` and will be retried on the
+                        # next startup; we don't raise and don't re-loop here.
+                        logger.warning(
+                            "[StockDaily] canonical_id derivation failed for "
+                            "code=%r (id=%s): %s — leaving NULL",
+                            code, row_id, exc,
+                        )
+                        total_skipped += 1
+                        continue
+
+                    if not derived:
+                        # Parser returned an empty canonical_id (None / '')
+                        # without raising — nothing meaningful to write. Skip
+                        # so the row is not falsely counted as backfilled and
+                        # no empty string is persisted as a stable key.
+                        total_skipped += 1
+                        continue
+
+                    result = connection.execute(
+                        text(
+                            f"UPDATE {StockDaily.__tablename__} "
+                            "SET canonical_id = :canonical_id "
+                            "WHERE id = :row_id AND canonical_id IS NULL"
+                        ),
+                        {"canonical_id": derived, "row_id": row_id},
+                    )
+                    if result.rowcount == 1:
+                        total_backfilled += 1
+                    elif result.rowcount == 0:
+                        # Lost the race with a concurrent writer — safe to skip,
+                        # the row is now non-null.
+                        total_skipped += 1
+                    else:
+                        raise RuntimeError(
+                            "canonical_id backfill updated an unexpected number "
+                            f"of rows for id={row_id}: {result.rowcount}"
+                        )
+
+        logger.info(
+            "[StockDaily] canonical_id backfill stats: backfilled_count=%s "
+            "skipped_count=%s",
+            total_backfilled,
+            total_skipped,
+        )
+
+    def _backfill_canonical_ids(self) -> None:
+        """Idempotent, batched repair of historical bare-code canonical_id buckets.
+
+        The previous ``_derive_canonical_id`` behavior preferred
+        ``matched_index.canonical_id``, so a bare six-digit code that collided
+        with an index identity (e.g. ``000001`` / ``000016`` / ``000688`` /
+        ``930955``) was written with the *index* canonical_id (``sh000001`` /
+        ``csi930955``) instead of the stock-path canonical_id (``sz000001`` /
+        ``bj930955``). This method repairs those rows.
+
+        Only rows matching ALL of the following are touched:
+          * ``code`` is a bare 6-digit numeric string (no explicit prefix/suffix)
+          * current ``canonical_id`` is non-NULL and hits an active index identity
+          * the parser's stock canonical_id differs from the current value
+
+        Explicit ``sh``/``sz``/``csi`` prefix and ``.SH``/``.SZ``/``.CSI``
+        suffix rows are never modified. The repair uses a monotonic ``id``
+        cursor and a conditional UPDATE (guarded by the current value) so it is
+        idempotent and safe under concurrent writers. When the registry is
+        empty the repair is a no-op and logs a WARNING.
+        """
+        if not self._is_sqlite_engine:
+            return
+        if not inspect(self._engine).has_table(StockDaily.__tablename__):
+            return
+
+        try:
+            from src.services.stock_list_parser import parse_analysis_target
+            from src.data.stock_index_loader import _load_active_index_rows
+        except Exception as exc:
+            logger.warning(
+                "[StockDaily] canonical_id repair cannot import parser/loader: %s — skipping",
+                exc,
+            )
+            return
+
+        active_rows = _load_active_index_rows()
+        if not active_rows:
+            logger.warning("[StockDaily] canonical_id repair skipped: index registry is empty")
+            return
+
+        # Build the set of active index canonical_ids to detect mis-bucketed rows.
+        active_index_canonicals = {
+            str(row[0]).strip() for row in active_rows if row and str(row[0]).strip()
+        }
+        if not active_index_canonicals:
+            logger.warning("[StockDaily] canonical_id repair skipped: no active index canonicals")
+            return
+
+        _BATCH_SIZE = 5000
+        total_repaired = 0
+        total_skipped = 0
+        last_id = 0
+
+        # Only rows whose current canonical_id hits an active index identity are
+        # candidates for repair. Push this filter into the SQL so repeated
+        # startup repairs do not scan the full table.
+        canonical_placeholders = ", ".join(f":c{i}" for i in range(len(active_index_canonicals)))
+        canonical_params = {f"c{i}": c for i, c in enumerate(sorted(active_index_canonicals))}
+
+        while True:
+            with self._engine.begin() as connection:
+                rows = connection.execute(
+                    text(
+                        f"SELECT id, code, canonical_id FROM {StockDaily.__tablename__} "
+                        "WHERE id > :last_id "
+                        f"AND canonical_id IN ({canonical_placeholders}) "
+                        "AND length(code) = 6 "
+                        "AND code NOT GLOB '*[^0-9]*' "
+                        f"ORDER BY id LIMIT {_BATCH_SIZE}"
+                    ),
+                    {"last_id": last_id, **canonical_params},
+                ).fetchall()
+
+            if not rows:
+                break
+
+            with self._engine.begin() as connection:
+                for row_id, code, current_canonical in rows:
+                    last_id = row_id
+                    code_str = str(code or "").strip()
+                    current = str(current_canonical or "").strip()
+
+                    # Only bare 6-digit numeric codes are candidates for repair.
+                    if not (code_str.isdigit() and len(code_str) == 6):
+                        total_skipped += 1
+                        continue
+
+                    try:
+                        target = parse_analysis_target(code_str)
+                    except Exception as exc:
+                        logger.warning(
+                            "[StockDaily] canonical_id repair derivation failed for "
+                            "code=%r (id=%s): %s — skipping",
+                            code_str, row_id, exc,
+                        )
+                        total_skipped += 1
+                        continue
+
+                    derived = target.canonical_id or None
+                    if not derived or derived == current:
+                        total_skipped += 1
+                        continue
+
+                    result = connection.execute(
+                        text(
+                            f"UPDATE {StockDaily.__tablename__} "
+                            "SET canonical_id = :derived "
+                            "WHERE id = :row_id AND canonical_id = :current"
+                        ),
+                        {"derived": derived, "row_id": row_id, "current": current},
+                    )
+                    if result.rowcount == 1:
+                        total_repaired += 1
+                    elif result.rowcount == 0:
+                        # Lost the race with a concurrent writer — safe to skip.
+                        total_skipped += 1
+                    else:
+                        raise RuntimeError(
+                            "canonical_id repair updated an unexpected number "
+                            f"of rows for id={row_id}: {result.rowcount}"
+                        )
+
+        logger.info(
+            "[StockDaily] canonical_id repair stats: repaired_count=%s skipped_count=%s",
+            total_repaired,
+            total_skipped,
+        )
+
+    def _ensure_intelligence_items_unique_index(self) -> None:
+        if not self._is_sqlite_engine:
+            return
+
+        if not inspect(self._engine).has_table("intelligence_items"):
+            return
+
+        try:
+            unique_indexes = self._list_sqlite_unique_indexes("intelligence_items")
+        except Exception as exc:
+            logger.warning(
+                "[Intelligence items] failed to inspect unique indexes; "
+                "skip migration/repair: %s",
+                exc,
+            )
+            return
+
+        target_columns = ("source_id", "url", "scope_type", "scope_value", "market")
+        has_target_index = any(tuple(cols) == target_columns for cols in unique_indexes)
+        has_legacy_url_unique = any(tuple(cols) == ("url",) for cols in unique_indexes)
+
+        if has_target_index:
+            return
+        if unique_indexes and not has_legacy_url_unique:
+            # Table has other unique index shapes; avoid aggressive changes and add
+            # the expected scoped uniqueness directly.
+            self._ensure_intelligence_items_scoped_unique_index_once()
+            return
+
+        self._rebuild_intelligence_items_table()
+
+    def _rebuild_intelligence_items_table(self) -> None:
+        temporary_table = f"intelligence_items_recreate_tmp_{int(time.time() * 1_000_000_000)}"
+        columns = [column.name for column in IntelligenceItem.__table__.columns]
+        select_clause = ", ".join(f'"{column}"' for column in columns)
+        scoped_index_columns = ", ".join(["source_id", "url", "scope_type", "scope_value", "market"])
+        scoped_index_name = "uix_intel_item_scope"
+
+        tmp_metadata = MetaData()
+        tmp_table = Table(
+            temporary_table,
+            tmp_metadata,
+            *(column.copy() for column in IntelligenceItem.__table__.columns),
+        )
+        logger.info("Rebuilding intelligence_items table to align composite uniqueness constraints.")
+        with self._engine.begin() as connection:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{temporary_table}"'))
+            tmp_table.create(connection)
+            connection.execute(
+                text(
+                    f"INSERT INTO \"{temporary_table}\" ({select_clause}) "
+                    f"SELECT {select_clause} FROM intelligence_items"
+                )
+            )
+            connection.execute(text('DROP TABLE "intelligence_items"'))
+            connection.execute(
+                text(f'ALTER TABLE "{temporary_table}" RENAME TO intelligence_items')
+            )
+            connection.execute(
+                text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {scoped_index_name} ON "
+                    f"intelligence_items ({scoped_index_columns})"
+                )
+            )
+
+    def _ensure_intelligence_items_scoped_unique_index_once(self) -> None:
+        target_index_name = "uix_intel_item_scope"
+        with self._engine.begin() as connection:
+            rows = connection.execute(
+                text("PRAGMA index_list(intelligence_items)")
+            ).fetchall()
+            for row in rows:
+                if row[1] == target_index_name:
+                    return
+            index_columns = ", ".join(["source_id", "url", "scope_type", "scope_value", "market"])
+            connection.execute(
+                text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {target_index_name} ON "
+                    f"intelligence_items ({index_columns})"
+                )
+            )
+
+    def _list_sqlite_unique_indexes(self, table_name: str):
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                text(f"PRAGMA index_list({table_name})")
+            ).fetchall()
+            unique_indexes = []
+            for row in rows:
+                # row: (seq, name, unique, origin, partial)
+                if int(row[2]) != 1:
+                    continue
+                index_name = row[1]
+                index_columns = []
+                for index_info in connection.execute(
+                    text(f"PRAGMA index_xinfo({index_name})")
+                ).fetchall():
+                    # index_xinfo: (seqno, cid, name, desc, coll, key, ... )
+                    column_name = index_info[2]
+                    if column_name is None:
+                        continue
+                    index_columns.append(column_name)
+                unique_indexes.append(index_columns)
+            return unique_indexes
+
+    def _ensure_llm_usage_telemetry_columns(self) -> None:
+        """Add nullable P0a usage telemetry columns to existing SQLite DBs."""
+        if not self._is_sqlite_engine:
+            return
+        try:
+            existing = {
+                column["name"]
+                for column in inspect(self._engine).get_columns(LLMUsage.__tablename__)
+            }
+        except Exception as exc:
+            logger.warning(
+                "[LLM usage] failed to inspect telemetry columns; "
+                "skipping best-effort SQLite telemetry column backfill: %s",
+                exc,
+            )
+            return
+
+        max_retries = self._sqlite_write_retry_max
+        for column, column_type in _LLM_USAGE_TELEMETRY_COLUMN_SQL.items():
+            if column in existing:
+                continue
+            for attempt in range(max_retries + 1):
+                try:
+                    with self._engine.begin() as connection:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {LLMUsage.__tablename__} "
+                            f"ADD COLUMN {column} {column_type}"
+                        )
+                    existing.add(column)
+                    break
+                except OperationalError as exc:
+                    if self._is_sqlite_duplicate_column_error(exc, column):
+                        existing.add(column)
+                        break
+                    if self._is_sqlite_locked_error(exc) and attempt < max_retries:
+                        delay = self._sqlite_write_retry_base_delay * (2 ** attempt)
+                        logger.warning(
+                            "[LLM usage] SQLite telemetry column backfill locked, "
+                            "retrying: %s (%s/%s, %.2fs)",
+                            column,
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                        )
+                        if delay > 0:
+                            time.sleep(delay)
+                        continue
+                    raise
+
+    def _ensure_intelligence_item_scope_values(self) -> None:
+        """Backfill nullable intelligence item scopes so SQLite unique keys work."""
+        if not self._is_sqlite_engine:
+            return
+        try:
+            existing = {
+                column["name"]
+                for column in inspect(self._engine).get_columns(IntelligenceItem.__tablename__)
+            }
+        except Exception as exc:
+            logger.warning("资讯池 scope_value 回填检查失败，已跳过: %s", exc)
+            return
+        if "scope_value" not in existing:
+            return
+        try:
+            with self._engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"UPDATE {IntelligenceItem.__tablename__} "
+                    "SET scope_value = ? "
+                    "WHERE scope_value IS NULL OR scope_value = ''",
+                    (INTELLIGENCE_ITEM_NULL_SCOPE_VALUE,),
+                )
+        except Exception as exc:
+            logger.warning("资讯池 scope_value 回填失败，已跳过: %s", exc)
 
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
@@ -971,6 +2253,11 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 "database table is locked",
             )
         )
+
+    @staticmethod
+    def _is_sqlite_duplicate_column_error(exc: OperationalError, column: str) -> bool:
+        err_text = str(getattr(exc, "orig", exc)).lower()
+        return "duplicate column name" in err_text and column.lower() in err_text
 
     @staticmethod
     def _normalize_daily_date(value: Any) -> Any:
@@ -1289,6 +2576,174 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             except Exception:
                 return None
 
+    def save_screening_run(self, payload: Dict[str, Any]) -> int:
+        """Persist one completed screening response without blocking screening on DB errors."""
+        run_id = str(payload.get("run_id") or "").strip()
+        if not run_id:
+            return 0
+        normalized_payload = dict(payload)
+        warnings = self._screening_warning_values(normalized_payload)
+        normalized_payload["warnings"] = warnings
+
+        values = {
+            "strategy": str(normalized_payload.get("strategy") or "").strip() or "unknown",
+            "market": str(normalized_payload.get("market") or "").strip() or "cn",
+            "snapshot_source": str(normalized_payload.get("snapshot_source") or "").strip() or None,
+            "snapshot_count": self._optional_int(normalized_payload.get("snapshot_count")),
+            "after_filter_count": self._optional_int(normalized_payload.get("after_filter_count")),
+            "candidate_count": self._optional_int(normalized_payload.get("candidate_count")) or 0,
+            "llm_ranked": self._optional_bool(normalized_payload.get("llm_ranked")),
+            "daily_enriched": self._optional_bool(normalized_payload.get("daily_enriched")),
+            "source_errors_json": self._safe_json_dumps(normalized_payload.get("source_errors") or []),
+            "warnings_json": self._safe_json_dumps(warnings),
+            "result_json": self._safe_json_dumps(normalized_payload),
+        }
+
+        try:
+            def _write(session: Session) -> int:
+                row = session.execute(
+                    select(ScreeningRun).where(ScreeningRun.run_id == run_id)
+                ).scalar_one_or_none()
+                if row is None:
+                    session.add(ScreeningRun(run_id=run_id, **values))
+                else:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+                return 1
+
+            return self._run_write_transaction(
+                f"save_screening_run[{run_id}]",
+                _write,
+            )
+        except Exception as exc:
+            logger.warning(
+                "选股运行历史写入失败（fail-open）: run_id=%s err=%s",
+                run_id,
+                exc,
+            )
+            return 0
+
+    def list_screening_runs(
+        self,
+        *,
+        limit: int = 20,
+        strategy: Optional[str] = None,
+        market: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List recent screening runs as compact summaries."""
+        normalized_limit = max(0, min(int(limit), 100))
+        if normalized_limit <= 0:
+            return []
+
+        with self.get_session() as session:
+            statement = select(ScreeningRun)
+            if strategy:
+                statement = statement.where(ScreeningRun.strategy == str(strategy).strip())
+            if market:
+                statement = statement.where(ScreeningRun.market == str(market).strip())
+            rows = session.execute(
+                statement.order_by(desc(ScreeningRun.created_at), desc(ScreeningRun.id)).limit(normalized_limit)
+            ).scalars().all()
+            return [self._screening_run_to_dict(row, include_result=False) for row in rows]
+
+    def get_screening_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Load a completed screening run by its stable run id."""
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return None
+        with self.get_session() as session:
+            row = session.execute(
+                select(ScreeningRun).where(ScreeningRun.run_id == normalized_run_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return self._screening_run_to_dict(row, include_result=True)
+
+    @staticmethod
+    def _optional_int(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _optional_bool(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            return None
+        return bool(value)
+
+    @staticmethod
+    def _screening_json_list(value: Optional[str]) -> List[Any]:
+        try:
+            decoded = json.loads(value or "[]")
+        except (TypeError, ValueError):
+            return []
+        return decoded if isinstance(decoded, list) else []
+
+    @staticmethod
+    def _screening_text_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            result = []
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    result.append(text)
+            return result
+        text = str(value or "").strip()
+        return [text] if text else []
+
+    @classmethod
+    def _screening_warning_values(cls, payload: Dict[str, Any]) -> List[str]:
+        warnings: List[str] = []
+        seen: set[str] = set()
+        for key in ("warnings", "degradation"):
+            for item in cls._screening_text_list(payload.get(key)):
+                if item in seen:
+                    continue
+                seen.add(item)
+                warnings.append(item)
+        return warnings
+
+    @classmethod
+    def _screening_run_to_dict(
+        cls,
+        row: ScreeningRun,
+        *,
+        include_result: bool,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "run_id": row.run_id,
+            "strategy": row.strategy,
+            "market": row.market,
+            "snapshot_source": row.snapshot_source or "",
+            "snapshot_count": row.snapshot_count,
+            "after_filter_count": row.after_filter_count,
+            "candidate_count": row.candidate_count,
+            "llm_ranked": row.llm_ranked,
+            "daily_enriched": row.daily_enriched,
+            "source_errors": cls._screening_json_list(row.source_errors_json),
+            "warnings": cls._screening_json_list(row.warnings_json),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        if include_result:
+            try:
+                result = json.loads(row.result_json or "{}")
+            except (TypeError, ValueError):
+                result = {}
+            payload["result"] = result if isinstance(result, dict) else {}
+        return payload
+
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
         """
         获取指定股票最近 N 天的新闻情报
@@ -1346,7 +2801,10 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         save_snapshot: bool = True
     ) -> int:
         """
-        保存分析结果历史记录
+        保存分析结果历史记录。
+
+        Returns:
+            新保存的 AnalysisHistory.id；保存失败返回 0。
         """
         if result is None:
             return 0
@@ -1359,27 +2817,27 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         try:
             def _write(session: Session) -> int:
-                session.add(
-                    AnalysisHistory(
-                        query_id=query_id,
-                        code=result.code,
-                        name=result.name,
-                        report_type=report_type,
-                        sentiment_score=result.sentiment_score,
-                        operation_advice=result.operation_advice,
-                        trend_prediction=result.trend_prediction,
-                        analysis_summary=result.analysis_summary,
-                        raw_result=self._safe_json_dumps(raw_result),
-                        news_content=news_content,
-                        context_snapshot=context_text,
-                        ideal_buy=sniper_points.get("ideal_buy"),
-                        secondary_buy=sniper_points.get("secondary_buy"),
-                        stop_loss=sniper_points.get("stop_loss"),
-                        take_profit=sniper_points.get("take_profit"),
-                        created_at=datetime.now(),
-                    )
+                history = AnalysisHistory(
+                    query_id=query_id,
+                    code=result.code,
+                    name=result.name,
+                    report_type=report_type,
+                    sentiment_score=result.sentiment_score,
+                    operation_advice=result.operation_advice,
+                    trend_prediction=result.trend_prediction,
+                    analysis_summary=result.analysis_summary,
+                    raw_result=self._safe_json_dumps(raw_result),
+                    news_content=news_content,
+                    context_snapshot=context_text,
+                    ideal_buy=sniper_points.get("ideal_buy"),
+                    secondary_buy=sniper_points.get("secondary_buy"),
+                    stop_loss=sniper_points.get("stop_loss"),
+                    take_profit=sniper_points.get("take_profit"),
+                    created_at=datetime.now(),
                 )
-                return 1
+                session.add(history)
+                session.flush()
+                return int(history.id or 0)
             return self._run_write_transaction(
                 f"save_analysis_history[{result.code}]",
                 _write,
@@ -1508,10 +2966,39 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             ).scalars().all()
 
             return list(results)
+
+    def get_latest_analysis_history_id(
+        self,
+        *,
+        query_id: str,
+        code: str,
+        report_type: str,
+    ) -> Optional[int]:
+        """Return the latest matching history id for read-only lookups.
+
+        P2 automatic DecisionSignal extraction receives the freshly saved id
+        directly from ``save_analysis_history()`` and does not use this helper.
+        """
+
+        if not query_id or not code or not report_type:
+            return None
+
+        with self.get_session() as session:
+            return session.execute(
+                select(AnalysisHistory.id)
+                .where(
+                    AnalysisHistory.query_id == query_id,
+                    AnalysisHistory.code == code,
+                    AnalysisHistory.report_type == report_type,
+                )
+                .order_by(desc(AnalysisHistory.created_at), desc(AnalysisHistory.id))
+                .limit(1)
+            ).scalar_one_or_none()
     
     def get_analysis_history_paginated(
         self,
-        code: Optional[str] = None,
+        code: Optional[Union[str, List[str]]] = None,
+        report_type: Optional[str] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         offset: int = 0,
@@ -1522,6 +3009,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         
         Args:
             code: 股票代码筛选
+            report_type: 报告类型筛选
             start_date: 开始日期（含）
             end_date: 结束日期（含）
             offset: 偏移量（跳过前 N 条）
@@ -1536,7 +3024,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             conditions = []
             
             if code:
-                conditions.append(AnalysisHistory.code == code)
+                if isinstance(code, list):
+                    codes = [c for c in code if c]
+                    if codes:
+                        conditions.append(AnalysisHistory.code.in_(codes))
+                else:
+                    conditions.append(AnalysisHistory.code == code)
+            if report_type:
+                conditions.append(AnalysisHistory.report_type == report_type)
             if start_date:
                 # created_at >= start_date 00:00:00
                 conditions.append(AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time()))
@@ -1586,7 +3081,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         """
         删除指定的分析历史记录。
 
-        同时清理依赖这些历史记录的回测结果，避免外键约束失败。
+        同时清理依赖这些历史记录的回测结果和分析来源决策信号，避免
+        依赖历史记录的派生数据残留。DecisionSignal 的 source_report_id
+        允许弱引用，因此这里只清理 source_type=analysis 的真实历史绑定信号。
 
         Args:
             record_ids: 要删除的历史记录主键 ID 列表
@@ -1598,16 +3095,142 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         if not ids:
             return 0
 
-        with self.session_scope() as session:
+        def _write(session: Session) -> int:
+            existing_ids = sorted(
+                session.execute(
+                    select(AnalysisHistory.id).where(AnalysisHistory.id.in_(ids))
+                ).scalars().all()
+            )
+            if not existing_ids:
+                return 0
+
+            linked_signal_ids = sorted(
+                session.execute(
+                    select(DecisionSignalRecord.id).where(
+                        and_(
+                            DecisionSignalRecord.source_type == "analysis",
+                            DecisionSignalRecord.source_report_id.in_(existing_ids),
+                        )
+                    )
+                ).scalars().all()
+            )
+            if linked_signal_ids:
+                session.execute(
+                    delete(DecisionSignalOutcomeRecord).where(
+                        DecisionSignalOutcomeRecord.signal_id.in_(linked_signal_ids)
+                    )
+                )
+                session.execute(
+                    delete(DecisionSignalFeedbackRecord).where(
+                        DecisionSignalFeedbackRecord.signal_id.in_(linked_signal_ids)
+                    )
+                )
+                session.execute(
+                    delete(DecisionSignalRecord).where(DecisionSignalRecord.id.in_(linked_signal_ids))
+                )
             session.execute(
-                delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(ids))
+                delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(existing_ids))
+            )
+            linked_skill_sample_ids = sorted(
+                session.execute(
+                    select(SkillOpinionSampleRecord.id).where(
+                        SkillOpinionSampleRecord.analysis_history_id.in_(existing_ids)
+                    )
+                ).scalars().all()
+            )
+            if linked_skill_sample_ids:
+                session.execute(
+                    delete(SkillOpinionOutcomeRecord).where(
+                        SkillOpinionOutcomeRecord.skill_opinion_sample_id.in_(
+                            linked_skill_sample_ids
+                        )
+                    )
+                )
+            session.execute(
+                delete(SkillOpinionSampleRecord).where(
+                    SkillOpinionSampleRecord.analysis_history_id.in_(existing_ids)
+                )
             )
             result = session.execute(
-                delete(AnalysisHistory).where(AnalysisHistory.id.in_(ids))
+                delete(AnalysisHistory).where(AnalysisHistory.id.in_(existing_ids))
             )
             return result.rowcount or 0
 
-    def get_latest_analysis_by_query_id(self, query_id: str) -> Optional[AnalysisHistory]:
+        return self._run_write_transaction(
+            "delete analysis history records",
+            _write,
+        )
+
+    def get_distinct_stocks_from_history(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        limit: int = 200,
+        include_market_review: bool = False,
+    ) -> List[AnalysisHistory]:
+        """
+        获取历史记录中的不重复股票列表，每只股票取最新一条记录。
+
+        使用子查询按 code 分组取 MAX(id)，再 JOIN 回查完整记录。
+        默认排除大盘复盘，避免混入普通个股栏。
+
+        Args:
+            start_date: 开始日期
+            end_date: 结束日期
+            limit: 最大返回数量
+            include_market_review: 是否包含大盘复盘记录
+
+        Returns:
+            每条股票最新一条 AnalysisHistory 记录列表
+        """
+        with self.get_session() as session:
+            subq = (
+                select(
+                    AnalysisHistory.code,
+                    func.max(AnalysisHistory.id).label("max_id"),
+                )
+            )
+            if start_date:
+                subq = subq.where(
+                    AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time())
+                )
+            if end_date:
+                subq = subq.where(
+                    AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+                )
+            if not include_market_review:
+                subq = subq.where(
+                    and_(
+                        AnalysisHistory.code != "MARKET",
+                        or_(
+                            AnalysisHistory.report_type.is_(None),
+                            AnalysisHistory.report_type != "market_review",
+                        ),
+                    )
+                )
+            subq = subq.group_by(AnalysisHistory.code).subquery()
+
+            results = (
+                session.execute(
+                    select(AnalysisHistory)
+                    .join(subq, AnalysisHistory.id == subq.c.max_id)
+                    .order_by(
+                        desc(AnalysisHistory.created_at),
+                    )
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            return list(results)
+
+    def get_latest_analysis_by_query_id(
+        self,
+        query_id: str,
+        *,
+        code: Optional[str] = None,
+        report_type: Optional[str] = None,
+    ) -> Optional[AnalysisHistory]:
         """
         根据 query_id 查询最新一条分析历史记录
 
@@ -1615,14 +3238,22 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         Args:
             query_id: 分析记录关联的 query_id
+            code: 可选股票代码过滤，用于区分同一 query_id 下的 MARKET 与个股记录
+            report_type: 可选报告类型过滤
 
         Returns:
             AnalysisHistory 对象，不存在返回 None
         """
         with self.get_session() as session:
+            conditions = [AnalysisHistory.query_id == query_id]
+            if code:
+                conditions.append(AnalysisHistory.code == code)
+            if report_type:
+                conditions.append(AnalysisHistory.report_type == report_type)
+
             result = session.execute(
                 select(AnalysisHistory)
-                .where(AnalysisHistory.query_id == query_id)
+                .where(and_(*conditions))
                 .order_by(desc(AnalysisHistory.created_at))
                 .limit(1)
             ).scalars().first()
@@ -1664,7 +3295,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         self, 
         df: pd.DataFrame, 
         code: str,
-        data_source: str = "Unknown"
+        data_source: str = "Unknown",
+        canonical_id: Optional[str] = None,
     ) -> int:
         """
         保存日线数据到数据库
@@ -1673,11 +3305,19 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         - 按 `(code, date)` 做批量 UPSERT，已存在记录会覆盖更新
         - 同一批次内若存在重复日期，以最后一条记录为准
         - SQLite 分支按 chunk 写入以避免绑定参数上限
+        - ``canonical_id``（Expand-Contract PR2）：显式传入则双写；
+          未传（``None``）时用 ``_derive_canonical_id(code)`` 延迟推导
+          （裸码恒为 stock canonical，如 ``000300`` -> ``sz000300``；
+          仅显式指数形式如 ``sh000300`` / ``930955.CSI`` 推导为指数
+          canonical_id；历史被错误写成指数桶的裸码行由
+          ``_backfill_canonical_ids()`` 幂等修复），推导失败写 NULL 降级（D1）。
         
         Args:
             df: 包含日线数据的 DataFrame
             code: 股票代码
             data_source: 数据来源名称
+            canonical_id: Phase 1 前缀格式稳定键（如 ``sh000300``）；为 ``None``
+                时自动推导。
             
         Returns:
             本次实际新增的记录数（不含更新）
@@ -1685,6 +3325,25 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         if df is None or df.empty:
             logger.warning(f"保存数据为空，跳过 {code}")
             return 0
+
+        # D1: canonical_id=None → derive via the Phase 1 parser; on failure
+        # degrade to NULL (do NOT raise — read path still uses ``code``).
+        # Empty string is treated like None (never persisted as a key).
+        # Parser contract (OR-COR-4f9ffc38): a bare code always derives the
+        # stock canonical_id (e.g. ``000300`` -> ``sz000300``); only explicit
+        # index forms (``sh000300`` / ``930955.CSI``) derive an index canonical_id.
+        # Historical bare rows mis-written as an index identity are repaired
+        # separately by the idempotent ``_backfill_canonical_ids()``.
+        if not canonical_id:
+            try:
+                canonical_id = self._derive_canonical_id(code)
+            except Exception as exc:
+                logger.warning(
+                    "save_daily_data: canonical_id derivation failed for "
+                    "code=%r: %s — writing NULL",
+                    code, exc,
+                )
+                canonical_id = None
 
         now = datetime.now()
         records_by_date: Dict[date, Dict[str, Any]] = {}
@@ -1705,6 +3364,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 'ma20': self._normalize_sql_value(row.get('ma20')),
                 'volume_ratio': self._normalize_sql_value(row.get('volume_ratio')),
                 'data_source': data_source,
+                'canonical_id': canonical_id,
                 'created_at': now,
                 'updated_at': now,
             }
@@ -1718,7 +3378,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         def _write(session: Session) -> int:
             if self._is_sqlite_engine:
                 # SQLite has a per-statement bind-parameter limit (commonly 999).
-                # Each record has ~15 columns, so chunk upserts to stay within bounds.
+                # Each record has ~17 columns, so chunk upserts to stay within bounds.
                 _SQLITE_CHUNK = 50
                 # `_run_write_transaction()` opens SQLite writes with
                 # `BEGIN IMMEDIATE`, so existence checks and upsert execute
@@ -1762,6 +3422,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                                 'ma20': excluded.ma20,
                                 'volume_ratio': excluded.volume_ratio,
                                 'data_source': excluded.data_source,
+                                # D1 degrade: never overwrite a previously
+                                # backfilled non-NULL canonical_id with NULL.
+                                'canonical_id': func.coalesce(
+                                    excluded.canonical_id,
+                                    StockDaily.canonical_id,
+                                ),
                                 'updated_at': excluded.updated_at,
                             },
                         )
@@ -1798,6 +3464,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     existing.ma20 = record['ma20']
                     existing.volume_ratio = record['volume_ratio']
                     existing.data_source = record['data_source']
+                    if record['canonical_id'] is not None:
+                        existing.canonical_id = record['canonical_id']
                     existing.updated_at = record['updated_at']
                 return new_count
 
@@ -1959,146 +3627,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
     @staticmethod
     def _parse_sniper_value(value: Any) -> Optional[float]:
-        """
-        Parse a sniper point value from various formats to float.
-
-        Handles: numeric types, plain number strings, Chinese price formats
-        like "18.50元", range formats like "18.50-19.00", and text with
-        embedded numbers while filtering out MA indicators.
-        """
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            v = float(value)
-            return v if v > 0 else None
-
-        text = str(value).replace(',', '').replace('，', '').strip()
-        if not text or text == '-' or text == '—' or text == 'N/A':
-            return None
-
-        # 尝试直接解析纯数字字符串
-        try:
-            return float(text)
-        except ValueError:
-            pass
-
-        # 优先截取 "：" 到 "元" 之间的价格，避免误提取 MA5/MA10 等技术指标数字
-        colon_pos = max(text.rfind("："), text.rfind(":"))
-        yuan_pos = text.find("元", colon_pos + 1 if colon_pos != -1 else 0)
-        if yuan_pos != -1:
-            segment_start = colon_pos + 1 if colon_pos != -1 else 0
-            segment = text[segment_start:yuan_pos]
-            
-            # 使用 finditer 并过滤掉 MA 开头的数字
-            matches = list(re.finditer(r"-?\d+(?:\.\d+)?", segment))
-            valid_numbers = []
-            for m in matches:
-                # 检查前面是否是 "MA" (忽略大小写)
-                start_idx = m.start()
-                if start_idx >= 2:
-                    prefix = segment[start_idx-2:start_idx].upper()
-                    if prefix == "MA":
-                        continue
-                valid_numbers.append(m.group())
-            
-            if valid_numbers:
-                try:
-                    return abs(float(valid_numbers[-1]))
-                except ValueError:
-                    pass
-
-        # 兜底：无"元"字时，先截去第一个括号后的内容，避免误提取括号内技术指标数字
-        # 例如 "1.52-1.53 (回踩MA5/10附近)" → 仅在 "1.52-1.53 " 中搜索
-        paren_pos = len(text)
-        for paren_char in ('(', '（'):
-            pos = text.find(paren_char)
-            if pos != -1:
-                paren_pos = min(paren_pos, pos)
-        search_text = text[:paren_pos].strip() or text  # 括号前为空时降级用全文
-
-        valid_numbers = []
-        for m in re.finditer(r"\d+(?:\.\d+)?", search_text):
-            start_idx = m.start()
-            if start_idx >= 2 and search_text[start_idx-2:start_idx].upper() == "MA":
-                continue
-            valid_numbers.append(m.group())
-        if valid_numbers:
-            try:
-                return float(valid_numbers[-1])
-            except ValueError:
-                pass
-        return None
+        return parse_sniper_value(value)
 
     def _extract_sniper_points(self, result: Any) -> Dict[str, Optional[float]]:
-        """
-        Extract sniper point values from an AnalysisResult.
+        """Extract normalized sniper point values from an AnalysisResult."""
 
-        Tries multiple extraction paths to handle different dashboard structures:
-        1. result.get_sniper_points() (standard path)
-        2. Direct dashboard dict traversal with various nesting levels
-        3. Fallback from raw_result dict if available
-        """
-        raw_points = {}
-
-        # Path 1: standard method
-        if hasattr(result, "get_sniper_points"):
-            raw_points = result.get_sniper_points() or {}
-
-        # Path 2: direct dashboard traversal when standard path yields empty values
-        if not any(raw_points.get(k) for k in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit")):
-            dashboard = getattr(result, "dashboard", None)
-            if isinstance(dashboard, dict):
-                raw_points = self._find_sniper_in_dashboard(dashboard) or raw_points
-
-        # Path 3: try raw_result for agent mode results
-        if not any(raw_points.get(k) for k in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit")):
-            raw_response = getattr(result, "raw_response", None)
-            if isinstance(raw_response, dict):
-                raw_points = self._find_sniper_in_dashboard(raw_response) or raw_points
-
-        return {
-            "ideal_buy": self._parse_sniper_value(raw_points.get("ideal_buy")),
-            "secondary_buy": self._parse_sniper_value(raw_points.get("secondary_buy")),
-            "stop_loss": self._parse_sniper_value(raw_points.get("stop_loss")),
-            "take_profit": self._parse_sniper_value(raw_points.get("take_profit")),
-        }
-
-    @staticmethod
-    def _find_sniper_in_dashboard(d: dict) -> Optional[Dict[str, Any]]:
-        """
-        Recursively search for sniper_points in a dashboard dict.
-        Handles various nesting: dashboard.battle_plan.sniper_points,
-        dashboard.dashboard.battle_plan.sniper_points, etc.
-        """
-        if not isinstance(d, dict):
-            return None
-
-        # Direct: d has sniper_points keys at top level
-        if "ideal_buy" in d:
-            return d
-
-        # d.sniper_points
-        sp = d.get("sniper_points")
-        if isinstance(sp, dict) and sp:
-            return sp
-
-        # d.battle_plan.sniper_points
-        bp = d.get("battle_plan")
-        if isinstance(bp, dict):
-            sp = bp.get("sniper_points")
-            if isinstance(sp, dict) and sp:
-                return sp
-
-        # d.dashboard.battle_plan.sniper_points (double-nested)
-        inner = d.get("dashboard")
-        if isinstance(inner, dict):
-            bp = inner.get("battle_plan")
-            if isinstance(bp, dict):
-                sp = bp.get("sniper_points")
-                if isinstance(sp, dict) and sp:
-                    return sp
-
-        return None
+        return extract_sniper_points(result)
 
     @staticmethod
     def _build_fallback_url_key(
@@ -2128,6 +3662,54 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             session.add(msg)
             session.flush()
             return int(msg.id)
+
+    def save_conversation_user_turn(
+        self,
+        session_id: str,
+        content: str,
+        selected_skill_ids: Optional[List[str]] = None,
+    ) -> int:
+        """Persist a user message and an optional session Skill selection atomically."""
+        with self.session_scope() as session:
+            msg = ConversationMessage(
+                session_id=session_id,
+                role="user",
+                content=content,
+            )
+            session.add(msg)
+            session.flush()
+
+            if selected_skill_ids is not None:
+                now = datetime.now()
+                values = {
+                    "session_id": session_id,
+                    "selected_skill_ids_json": json.dumps(selected_skill_ids, ensure_ascii=False),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                stmt = sqlite_insert(ConversationSessionState).values(**values)
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=["session_id"],
+                        set_={
+                            "selected_skill_ids_json": values["selected_skill_ids_json"],
+                            "updated_at": now,
+                        },
+                    )
+                )
+
+            return int(msg.id)
+
+    def get_conversation_session_selected_skill_ids(
+        self,
+        session_id: str,
+    ) -> Optional[List[str]]:
+        """Return the saved Skill selection, or None when the session has no state row."""
+        with self.session_scope() as session:
+            state = session.get(ConversationSessionState, session_id)
+            if state is None:
+                return None
+            return json.loads(state.selected_skill_ids_json)
 
     def get_conversation_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
@@ -2470,6 +4052,11 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         """
         with self.session_scope() as session:
             session.execute(
+                delete(ConversationSessionState).where(
+                    ConversationSessionState.session_id == session_id
+                )
+            )
+            session.execute(
                 delete(AgentProviderTurn).where(
                     AgentProviderTurn.session_id == session_id
                 )
@@ -2498,16 +4085,20 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         completion_tokens: int,
         total_tokens: int,
         stock_code: Optional[str] = None,
+        **telemetry: Any,
     ) -> None:
         """Append one LLM call record to llm_usage."""
-        row = LLMUsage(
-            call_type=call_type,
-            model=model or "unknown",
-            stock_code=stock_code,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-        )
+        row_values: Dict[str, Any] = {
+            "call_type": call_type,
+            "model": model or "unknown",
+            "stock_code": stock_code,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+        for column in _LLM_USAGE_TELEMETRY_COLUMN_SQL:
+            row_values[column] = None if column in _LLM_USAGE_DROPPED_FREE_TEXT_COLUMNS else telemetry.get(column)
+        row = LLMUsage(**row_values)
         with self.session_scope() as session:
             session.add(row)
 
@@ -2519,9 +4110,11 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         """Return aggregated token usage between from_dt and to_dt.
 
         Returns a dict with keys:
-          total_calls, total_tokens,
-          by_call_type: list of {call_type, calls, total_tokens},
-          by_model:     list of {model, calls, total_tokens}
+          total_calls, total_prompt_tokens, total_completion_tokens, total_tokens,
+          by_call_type: list of {call_type, calls, prompt_tokens,
+            completion_tokens, total_tokens},
+          by_model: list of {model, calls, prompt_tokens, completion_tokens,
+            total_tokens, max_total_tokens}
         """
         with self.session_scope() as session:
             base_filter = and_(
@@ -2533,6 +4126,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             totals = session.execute(
                 select(
                     func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.prompt_tokens), 0).label("prompt_tokens"),
+                    func.coalesce(func.sum(LLMUsage.completion_tokens), 0).label("completion_tokens"),
                     func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
                 ).where(base_filter)
             ).one()
@@ -2542,6 +4137,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 select(
                     LLMUsage.call_type,
                     func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.prompt_tokens), 0).label("prompt_tokens"),
+                    func.coalesce(func.sum(LLMUsage.completion_tokens), 0).label("completion_tokens"),
                     func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
                 )
                 .where(base_filter)
@@ -2554,7 +4151,10 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 select(
                     LLMUsage.model,
                     func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.prompt_tokens), 0).label("prompt_tokens"),
+                    func.coalesce(func.sum(LLMUsage.completion_tokens), 0).label("completion_tokens"),
                     func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
+                    func.coalesce(func.max(LLMUsage.total_tokens), 0).label("max_total_tokens"),
                 )
                 .where(base_filter)
                 .group_by(LLMUsage.model)
@@ -2563,16 +4163,80 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         return {
             "total_calls": totals.calls,
+            "total_prompt_tokens": totals.prompt_tokens,
+            "total_completion_tokens": totals.completion_tokens,
             "total_tokens": totals.tokens,
             "by_call_type": [
-                {"call_type": r.call_type, "calls": r.calls, "total_tokens": r.tokens}
+                {
+                    "call_type": r.call_type,
+                    "calls": r.calls,
+                    "prompt_tokens": r.prompt_tokens,
+                    "completion_tokens": r.completion_tokens,
+                    "total_tokens": r.tokens,
+                }
                 for r in by_type_rows
             ],
             "by_model": [
-                {"model": r.model, "calls": r.calls, "total_tokens": r.tokens}
+                {
+                    "model": r.model,
+                    "calls": r.calls,
+                    "prompt_tokens": r.prompt_tokens,
+                    "completion_tokens": r.completion_tokens,
+                    "total_tokens": r.tokens,
+                    "max_total_tokens": r.max_total_tokens,
+                }
                 for r in by_model_rows
             ],
         }
+
+    def get_llm_usage_records(
+        self,
+        from_dt: datetime,
+        to_dt: datetime,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return recent LLM usage audit rows between from_dt and to_dt.
+
+        Each row contains id, call_type, model, stock_code, prompt_tokens,
+        completion_tokens, total_tokens, and called_at. Results are ordered by
+        newest call first, and limit is clamped to the public API range.
+        """
+        normalized_limit = max(1, min(int(limit or 50), 200))
+        with self.session_scope() as session:
+            rows = session.execute(
+                select(
+                    LLMUsage.id,
+                    LLMUsage.call_type,
+                    LLMUsage.model,
+                    LLMUsage.stock_code,
+                    LLMUsage.prompt_tokens,
+                    LLMUsage.completion_tokens,
+                    LLMUsage.total_tokens,
+                    LLMUsage.called_at,
+                )
+                .where(
+                    and_(
+                        LLMUsage.called_at >= from_dt,
+                        LLMUsage.called_at <= to_dt,
+                    )
+                )
+                .order_by(desc(LLMUsage.called_at), desc(LLMUsage.id))
+                .limit(normalized_limit)
+            ).all()
+
+        return [
+            {
+                "id": r.id,
+                "call_type": r.call_type,
+                "model": r.model,
+                "stock_code": r.stock_code,
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "total_tokens": r.total_tokens,
+                "called_at": r.called_at,
+            }
+            for r in rows
+        ]
 
 
 # 便捷函数
@@ -2589,17 +4253,86 @@ def persist_llm_usage(
 ) -> None:
     """Fire-and-forget: write one LLM call record to llm_usage. Never raises."""
     try:
+        if usage is None:
+            usage = {}
+        prompt_cache_telemetry_disabled = bool(
+            getattr(usage, _LLM_PROMPT_CACHE_TELEMETRY_DISABLED_ATTR, False)
+        )
+        prompt_tokens = _coerce_llm_usage_non_negative_int(usage.get("prompt_tokens")) or 0
+        completion_tokens = _coerce_llm_usage_non_negative_int(usage.get("completion_tokens")) or 0
+        total_tokens = _coerce_llm_usage_non_negative_int(usage.get("total_tokens")) or 0
+        telemetry = {
+            column: usage.get(column)
+            for column in _LLM_USAGE_TELEMETRY_COLUMN_SQL
+        }
+        if prompt_cache_telemetry_disabled:
+            for column in _LLM_PROMPT_CACHE_TELEMETRY_COLUMNS:
+                telemetry[column] = None
+        for column in _LLM_USAGE_INTEGER_TELEMETRY_COLUMNS:
+            telemetry[column] = _coerce_llm_usage_non_negative_int(telemetry.get(column))
+        telemetry["normalized_prompt_tokens"] = (
+            telemetry.get("normalized_prompt_tokens")
+            if telemetry.get("normalized_prompt_tokens") is not None
+            else prompt_tokens
+        )
+        telemetry["normalized_completion_tokens"] = (
+            telemetry.get("normalized_completion_tokens")
+            if telemetry.get("normalized_completion_tokens") is not None
+            else completion_tokens
+        )
+        telemetry["normalized_total_tokens"] = (
+            telemetry.get("normalized_total_tokens")
+            if telemetry.get("normalized_total_tokens") is not None
+            else total_tokens
+        )
+        has_usage_payload = bool(usage.get("provider_usage_json")) or any(
+            key in usage
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "normalized_prompt_tokens",
+                "normalized_completion_tokens",
+                "normalized_total_tokens",
+            )
+        )
+        if not prompt_cache_telemetry_disabled:
+            telemetry["cache_capability"] = usage.get("cache_capability") or "unknown"
+            telemetry["cache_eligibility"] = usage.get("cache_eligibility") or "unknown"
+            telemetry["cache_observation"] = usage.get("cache_observation") or (
+                "no_usage" if not has_usage_payload else "unknown"
+            )
         db = DatabaseManager.get_instance()
         db.record_llm_usage(
             call_type=call_type,
             model=model,
-            prompt_tokens=usage.get("prompt_tokens", 0) or 0,
-            completion_tokens=usage.get("completion_tokens", 0) or 0,
-            total_tokens=usage.get("total_tokens", 0) or 0,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
             stock_code=stock_code,
+            **telemetry,
         )
     except Exception as exc:
         logging.getLogger(__name__).warning("[LLM usage] failed to persist usage record: %s", exc)
+
+
+def _coerce_llm_usage_non_negative_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if value < 0 or not value.is_integer():
+            return None
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or not text.isdigit():
+            return None
+        return int(text)
+    return None
 
 
 if __name__ == "__main__":

@@ -1,3 +1,6 @@
+import type { AnalysisContextPackOverview, MarketPhaseSummary } from './analysis';
+import type { DecisionSignalItem } from './decisionSignals';
+
 export type AlertType =
   | 'price_cross'
   | 'price_change_percent'
@@ -117,6 +120,10 @@ export interface AlertTriggerItem {
   triggeredAt?: string | null;
   status: AlertTriggerStatus | string;
   diagnostics?: string | null;
+  marketPhaseSummary?: MarketPhaseSummary | null;
+  analysisContextPackOverview?: AnalysisContextPackOverview | null;
+  analysisVisibilitySource?: string | null;
+  decisionSignalSummary?: Partial<DecisionSignalItem> | null;
 }
 
 export interface AlertTriggerListResponse {

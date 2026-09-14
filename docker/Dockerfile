@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # ===================================
 # A股自选股智能分析系统 - Docker 镜像
 # ===================================
@@ -6,12 +8,14 @@
 FROM node:20-slim AS web-builder
 
 WORKDIR /app/apps/dsa-web
+ARG DSA_WEB_VERSION=0.0.0
+ARG DSA_WEB_REVISION=unknown
 
 COPY apps/dsa-web/package.json apps/dsa-web/package-lock.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci
 
 COPY apps/dsa-web/ ./
-RUN npm run build
+RUN DSA_WEB_VERSION="${DSA_WEB_VERSION}" DSA_WEB_REVISION="${DSA_WEB_REVISION}" npm run build
 
 # Pin to bookworm: wkhtmltopdf was removed from Debian testing (2025)
 FROM python:3.11-slim-bookworm
@@ -30,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     wkhtmltopdf \
     fontconfig \
+    fonts-noto-cjk \
     libjpeg62-turbo \
     libxrender1 \
     libxext6 \
@@ -43,7 +48,7 @@ RUN groupadd -g 1000 dsa && \
 COPY requirements.txt .
 
 # 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
 
 # 复制应用代码
 COPY *.py ./
@@ -55,10 +60,23 @@ COPY strategies/ ./strategies/
 COPY --from=web-builder /app/static ./static/
 COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
+# Verify globally bundled runtime dependencies without leaving SDK logs in the image.
+RUN mkdir -p /tmp/futu-sdk-smoke-home && \
+    HOME=/tmp/futu-sdk-smoke-home python -c "import src.services.screening.pipeline; import futu" && \
+    rm -rf /tmp/futu-sdk-smoke-home
+
 # 确保数据目录存在并授权给 non-root 用户
 RUN mkdir -p /app/data /app/logs /app/reports && \
     chown -R dsa:dsa /app && \
     chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# efinance 将搜索缓存（search-cache.json）写入自身安装包内的 data 目录，
+# 该目录默认归 root 所有；容器以非 root 用户 dsa 运行时写入会 PermissionError，
+# 导致 efinance 数据源每次抓取 A 股数据都失败并降级。预置目录属主给 dsa 修复此问题。
+# 动态解析路径，避免写死 Python 版本目录。
+RUN EF_DATA_DIR="$(python -c 'import efinance, pathlib; print(pathlib.Path(efinance.__file__).parent / "data")')" && \
+    mkdir -p "$EF_DATA_DIR" && \
+    chown -R dsa:dsa "$EF_DATA_DIR"
 
 # 设置环境变量默认值
 ENV PYTHONUNBUFFERED=1
