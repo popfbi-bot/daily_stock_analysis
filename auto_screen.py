@@ -23,12 +23,20 @@
 写回：通过 GitHub REST API 更新（不存在则创建）名为 STOCK_LIST 的 Repository Variable。
       DSA 主任务已用 `vars.STOCK_LIST || secrets.STOCK_LIST`，会自动读取最新值。
 
+选股模式（核心池 + 增补，默认只增补不覆盖）：
+  通过 CORE_STOCK_LIST 传入你的核心自选股，脚本始终保留它们，只额外把
+  当日新异动股补进去，绝不删除你的持仓。
+  最终 STOCK_LIST = 核心池 ∪ 当日新异动股（总数不超过 MAX_STOCKS，核心池优先占满）。
+  这样「自选股自动更新」= 你的底仓不动 + 机器人每天帮你挑新异动股。
+
 环境变量：
   GITHUB_REPOSITORY  owner/repo（GitHub Actions 自动注入）
   GITHUB_TOKEN       用于写回 Variable（Actions 自动注入，需 actions: write 权限）
+  CORE_STOCK_LIST    你的核心自选股（逗号分隔）。始终保留，机器人只增补、不删除。
+                     不传则为空，退化为纯异动选股（增补历史会累积）。
   UNIVERSE_SIZE      粗筛活跃股数量，默认 150
-  MAX_STOCKS         最终入选上限，默认 25
-  MIN_STOCKS         入选下限，不足则放宽条件 / 回退上期列表，默认 8
+  MAX_STOCKS         最终入选上限（含核心池），默认 25
+  MIN_STOCKS         含核心池在内的最低入选数，不足则放宽条件 / 回退上期列表，默认 8
   DRY_RUN=1          只打印结果，不写回 Variable
   OUTPUT_FILE        可选，把结果同时写入本地文件
   STOCK_LIST_FALLBACK  可选，极端情况回退用的上期自选股（逗号分隔）
@@ -136,7 +144,7 @@ def get_kline(tcode, days=320):
                     "close": float(p[2]),
                     "high": float(p[3]),
                     "low": float(p[4]),
-                    "volume": float(p[5]),  # 手
+                    "volume": float(p[5]),
                 }
             )
         except ValueError:
@@ -213,7 +221,6 @@ def kdj(highs, lows, closes, n=9, m1=3, m2=3):
             rsv_list.append(50.0)
         else:
             rsv_list.append((closes[i] - ll) / (hh - ll) * 100.0)
-    # K/D 初值 50，按 EMA(m1/m2) 递推
     k_val = 50.0
     d_val = 50.0
     for rsv in rsv_list:
@@ -282,9 +289,8 @@ def score_screen(rows, relaxed=False):
     if not relaxed and not broke:
         return None
 
-    # ---- 加分项 ----
     score = 0.0
-    score += min(vol_ratio / 0.5 * 0.5, 2.0)  # 量能
+    score += min(vol_ratio / 0.5 * 0.5, 2.0)
     if broke:
         score += 1.5
 
@@ -322,10 +328,12 @@ def score_screen(rows, relaxed=False):
     }
 
 
-def run(universe_size, max_stocks, min_stocks):
+def run(universe_size, max_stocks, min_stocks, core_codes=None):
+    core_codes = core_codes or []
+    core_set = set(core_codes)
     print(f"[auto-screen] 拉取活跃股 top {universe_size} ...")
     universe = get_universe(universe_size)
-    print(f"[auto-screen] 候选池 {len(universe)} 只")
+    print(f"[auto-screen] 候选池 {len(universe)} 只；核心池 {len(core_codes)} 只（始终保留，机器人不删）")
 
     strict, relaxed = [], []
     for idx, u in enumerate(universe, 1):
@@ -341,46 +349,66 @@ def run(universe_size, max_stocks, min_stocks):
                 r2 = score_screen(rows, relaxed=True)
                 if r2:
                     relaxed.append((u["code"], u["name"], r2))
-        except Exception as exc:  # noqa: BLE001 - 单只失败不影响整体
+        except Exception as exc:
             print(f"[auto-screen] 跳过 {u['code']}: {exc}")
         if idx % 25 == 0:
             print(f"[auto-screen] 已扫描 {idx}/{len(universe)}")
-        time.sleep(0.08)  # 轻量限流
+        time.sleep(0.08)
 
     strict.sort(key=lambda x: -x[2]["score"])
-    codes = [p[0] for p in strict[:max_stocks]]
-    detail = strict[:max_stocks]
 
-    # 不足下限：补充放宽信号（仅趋势+放量，其余作加分）
-    if len(codes) < min_stocks and relaxed:
+    final = list(core_codes)
+    detail = [
+        (c, c, {"score": "-", "days_since_cross": "-", "vol_ratio": "-",
+                "rsi": "-", "close": "-"}, True)
+        for c in core_codes
+    ]
+
+    for p in strict:
+        if p[0] in core_set:
+            continue
+        core_set.add(p[0])
+        final.append(p[0])
+        detail.append((p[0], p[1], p[2], False))
+        if len(final) >= max_stocks:
+            break
+
+    if len(final) < min_stocks and relaxed:
         relaxed.sort(key=lambda x: -x[2]["score"])
         for p in relaxed:
-            if p[0] not in codes:
-                codes.append(p[0])
-                detail.append(p)
-            if len(codes) >= min_stocks:
+            if p[0] not in core_set:
+                core_set.add(p[0])
+                final.append(p[0])
+                detail.append((p[0], p[1], p[2], False))
+            if len(final) >= min_stocks:
                 break
 
-    # 仍不足：回退上期列表
-    if len(codes) < min_stocks:
+    if len(final) < min_stocks:
         fb = os.getenv("STOCK_LIST_FALLBACK", "")
         fb_codes = [c.strip() for c in fb.split(",") if c.strip()]
         for c in fb_codes:
-            if c not in codes:
-                codes.append(c)
-            if len(codes) >= min_stocks:
+            if c not in core_set:
+                core_set.add(c)
+                final.append(c)
+                detail.append((c, c, {"score": "-", "days_since_cross": "-",
+                                     "vol_ratio": "-", "rsi": "-", "close": "-"}, False))
+            if len(final) >= min_stocks:
                 break
         if fb_codes:
             print(f"[auto-screen] 信号不足，已回退上期列表 {len(fb_codes)} 只")
 
-    print(f"[auto-screen] 严格命中 {len(strict)} 只，最终入选 {len(codes)} 只")
+    added = max(len(final) - len(core_codes), 0)
+    print(f"[auto-screen] 严格命中 {len(strict)} 只，最终入选 {len(final)} 只（核心 {len(core_codes)} + 增补 {added}）")
     for p in detail:
-        r = p[2]
-        print(
-            f"  {p[0]} {p[1]} | 分{r['score']} 金叉{r['days_since_cross']}天 "
-            f"放量{r['vol_ratio']}x RSI{r['rsi']} 收{r['close']}"
-        )
-    return codes
+        c, name, r, is_core = p
+        if is_core:
+            print(f"  [核心] {c} {name}")
+        else:
+            print(
+                f"  {c} {name} | 分{r['score']} 金叉{r['days_since_cross']}天 "
+                f"放量{r['vol_ratio']}x RSI{r['rsi']} 收{r['close']}"
+            )
+    return final
 
 
 def update_variable(repo, name, value, token):
@@ -398,7 +426,7 @@ def update_variable(repo, name, value, token):
             exists = r.status == 200
     except urllib.error.HTTPError as e:
         exists = e.code != 404
-    except Exception:  # noqa: BLE001
+    except Exception:
         exists = False
 
     body = json.dumps({"value": value}).encode("utf-8")
@@ -423,8 +451,10 @@ def main():
     universe_size = int(os.getenv("UNIVERSE_SIZE", "150"))
     max_stocks = int(os.getenv("MAX_STOCKS", "25"))
     min_stocks = int(os.getenv("MIN_STOCKS", "8"))
+    core_raw = os.getenv("CORE_STOCK_LIST", "")
+    core_codes = [c.strip() for c in core_raw.split(",") if c.strip()]
 
-    codes = run(universe_size, max_stocks, min_stocks)
+    codes = run(universe_size, max_stocks, min_stocks, core_codes)
     value = ",".join(codes)
     print(f"[auto-screen] 结果({len(codes)}): {value}")
 
@@ -449,6 +479,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"[auto-screen] 致命错误: {exc}", file=sys.stderr)
         sys.exit(1)
