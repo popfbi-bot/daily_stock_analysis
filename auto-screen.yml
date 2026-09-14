@@ -29,6 +29,10 @@ jobs:
           UNIVERSE_SIZE: '250'
           MAX_STOCKS: '15'
           MIN_STOCKS: '5'
+          # 核心自选股池：始终保留，机器人只增补新异动股、不删除。
+          # 默认用现有 STOCK_LIST 当核心池；若单独建了 CORE_STOCK_LIST 变量则优先用它
+          # （这样 STOCK_LIST 会被每天重新计算为「核心池 ∪ 当日新异动」，增补部分每日刷新）。
+          CORE_STOCK_LIST: ${{ vars.CORE_STOCK_LIST || vars.STOCK_LIST }}
           STOCK_LIST_FALLBACK: '600519'
           DRY_RUN: '1'
           OUTPUT_FILE: selected.txt
