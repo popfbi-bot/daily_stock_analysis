@@ -1,7 +1,7 @@
 name: 邮件自检
 
 # 【这个文件解决什么问题】
-# 原项目的「每日股票分析」workflow 在日志的「📋 配置检查」段落里
+# 原项目的「每日股票分析」workflow 在日志的「配置检查」段落里
 # 只打印了企业微信/飞书/Telegram/Discord/Slack 等渠道，唯独没有邮件，
 # 所以邮件配错了在日志里根本看不出来。
 #
@@ -10,18 +10,12 @@ name: 邮件自检
 # 【三种触发方式】
 #   1. 手动：Actions → 邮件自检 → Run workflow
 #      send_test_email = true   → 体检配置，再真实登录 SMTP 发一封测试邮件
-#      send_test_email = false  → 只体检配置，不发任何消息
+#      send_test_email = false  → 只体检配置，不发任何消息（这是默认值，避免误发）
 #   2. 自身变更：本文件被修改并推送到 main 时自动跑一次
 #      （paths 限定为只有本文件变化才触发，避免被其他提交误带动）
+#      注意：自身变更触发时默认不发信，只做诊断。
 #   3. 以上任一方式下，体检报告都会写到 .diag/notify-check-latest.txt，
 #      并提交回仓库，这样不需要仓库管理权限也能读取结果。
-#
-# 【五段输出】
-#   ① 确认这次跑的到底是哪个仓库、哪个分支
-#   ② 列出本仓库所有 Variables 的名字（不含值）
-#   ③ 逐个探测常见 Secret 名（含 STOCK_LIST），告诉你哪些真的存在
-#   ④ 给出结论与排查顺序
-#   ⑤ 探测仓库 Environments 名单
 #
 # 【安全约束】
 # 本仓库是公开仓库，报告会被提交回仓库，所以报告里
@@ -32,9 +26,9 @@ on:
   workflow_dispatch:
     inputs:
       send_test_email:
-        description: '是否真实发送一封测试邮件'
+        description: '是否真实发送一封测试邮件（默认 false：只体检配置、绝不发信）'
         required: true
-        default: true
+        default: false
         type: boolean
   push:
     paths:
@@ -66,10 +60,6 @@ jobs:
       - name: 创建必要目录
         run: mkdir -p data logs reports .diag
 
-      # ------------------------------------------------------------------
-      # 配置可见性全量体检：只报告"名字在不在"，绝不打印任何值
-      # 同时把同样的内容写进 .diag/notify-check-latest.txt 供外部读取
-      # ------------------------------------------------------------------
       - name: 配置可见性全量体检
         env:
           GH_REPO: ${{ github.repository }}
@@ -78,7 +68,6 @@ jobs:
           GH_WORKFLOW: ${{ github.workflow_ref }}
           GH_ACTOR: ${{ github.actor }}
           VARS_JSON: ${{ toJSON(vars) }}
-
           SEC_EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           SEC_EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SEC_EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
@@ -237,8 +226,8 @@ jobs:
           EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME }}
         run: python main.py --check-notify
 
-      - name: 真实发送一封测试邮件
-        if: ${{ always() && (github.event_name == 'push' || github.event.inputs.send_test_email == 'true') }}
+      - name: 真实发送一封测试邮件（默认不发，需手动勾选）
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && github.event.inputs.send_test_email == 'true' }}
         env:
           EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
@@ -285,8 +274,6 @@ jobs:
               return local[:3] + "***@" + domain
 
           def sanitize(text):
-              # 掩掉邮箱地址，并把换行显式化。
-              # 本仓库是公开的，报告会被提交回仓库，所以异常原文也不能直接输出。
               text = re.sub(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+",
                             lambda m: mask_email(m.group(0)), str(text))
               text = text.replace("\r\n", "<CRLF>").replace("\n", "<LF>").replace("\r", "<CR>")
@@ -308,11 +295,10 @@ jobs:
           print("EMAIL_RECEIVERS : 值长度 %d，按英文逗号切分得到 %d 个收件人" % (len(raw_recv), len(receivers)))
           print("EMAIL_SENDER_NAME:", "已设置" if os.getenv("EMAIL_SENDER_NAME") else "(未设置，用默认值)")
 
-          # 收件人格式结构自检：只报告结构，不输出地址本身
           if "\n" in raw_recv or "\r" in raw_recv:
               print("")
               print("⚠ 已定位问题：EMAIL_RECEIVERS 的值里含有换行符。")
-              print("   本项目代码只按英文逗号 split(\",\")，换行不会被切分，")
+              print("   本项目代码只按英文逗号 split(",")，换行不会被切分，")
               print("   整个值被当成单个收件人塞进 To 头，")
               print("   构造邮件时触发 HeaderWriteError: folded header contains newline。")
               print("   修复：多个收件人改用英文逗号分隔，例如 a@qq.com,b@qq.com")
@@ -385,15 +371,6 @@ jobs:
           _report.close()
           PY
 
-      # ------------------------------------------------------------------
-      # 探测仓库 Environments 名单。
-      # 起因：00-daily-analysis.yml 的 job 上写了 environment: STOCK_LIST。
-      # 该接口对 GITHUB_TOKEN 常常返回 403，读不到就只给指引，不算失败。
-      # ------------------------------------------------------------------
-      # 必须写 if: always()。GitHub Actions 在某一步失败后会跳过后续所有步骤，
-      # continue-on-error 只保证"这步失败不算 job 失败"，并不能让流程继续。
-      # 少了 always()，发信步骤一失败，下面的探测与报告回传就全被跳过，
-      # 结果就是只看得到一个红叉、什么诊断信息都拿不到。
       - name: 探测仓库 Environments 名单
         if: ${{ always() }}
         continue-on-error: true
@@ -455,11 +432,6 @@ jobs:
               print("请手动查看：https://github.com/%s/settings/environments" % repo)
           PY
 
-      # ------------------------------------------------------------------
-      # 把报告提交回仓库，方便在无仓库管理权限时读取结果。
-      # 报告内容无变化时不会产生提交。
-      # 提交信息带 [skip ci]，确保不会自己触发自己。
-      # ------------------------------------------------------------------
       - name: 把体检报告提交回仓库
         if: ${{ always() }}
         continue-on-error: true
