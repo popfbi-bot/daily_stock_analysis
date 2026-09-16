@@ -1,0 +1,72 @@
+name: LLM 端点连通性探针
+
+# 【这个文件解决什么问题】
+# 本仓库的每日分析任务跑在 GitHub Actions 上，runner 的出口 IP 在美国。
+# 而国内大模型平台（智谱/硅基流动/火山方舟等）普遍按 IP 地理位置限制访问，
+# 域名在浏览器里能打开 != 从 Actions 里调得通。
+#
+# 注册一堆账号拿到 Key 之后才发现「403 country」就白折腾了。
+# 所以先花 30 秒跑一次这个探针：不需要任何 API Key，
+# 直接看每个端点从 GitHub Actions 机房到底返不返回响应。
+#
+# 【怎么读结果】
+#   401 / 400 / 422  -> ✅ 可达（地域放行，只是探针用的是假 Key）
+#   404              -> ✅ 可达（地域放行，但接口路径或写法要调）
+#   403              -> ⚠️ 地域或权限被拒，这个平台用不了
+#   000 / ERR        -> ❌ 网络不通（DNS 失败或超时）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 探测各平台 API 从 GitHub Actions 是否可达
+        run: |
+          echo "=============================================================="
+          echo " LLM 端点连通性探针（出口 IP 位于 GitHub Actions 机房）"
+          echo "=============================================================="
+          echo ""
+          echo "出口 IP 信息："
+          curl -s --max-time 15 https://api.ipify.org 2>/dev/null || echo "(获取出口 IP 失败)"
+          echo ""
+          echo "--------------------------------------------------------------"
+          printf "%-16s %-8s %s\n" "平台" "状态码" "响应摘要"
+          echo "--------------------------------------------------------------"
+
+          probe() {
+            name="$1"
+            url="$2"
+            code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" --max-time 25 \
+              -X POST "$url" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer sk-probe-invalid-key-000000" \
+              -d '{"model":"probe","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' 2>/dev/null)
+            if [ -z "$code" ]; then code="ERR"; fi
+            body=$(head -c 120 /tmp/resp.txt 2>/dev/null | tr -d '\n' | tr -s ' ')
+            printf "%-16s %-8s %s\n" "$name" "$code" "$body"
+          }
+
+          probe "智谱-国内"   "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+          probe "智谱-国际"   "https://api.z.ai/api/paas/v4/chat/completions"
+          probe "硅基流动"    "https://api.siliconflow.cn/v1/chat/completions"
+          probe "火山方舟"    "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+          probe "阿里百炼-国内" "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+          probe "阿里百炼-新加坡" "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+          probe "DeepSeek"    "https://api.deepseek.com/chat/completions"
+          probe "Moonshot"    "https://api.moonshot.cn/v1/chat/completions"
+          probe "百度千帆"    "https://qianfan.baidubce.com/v2/chat/completions"
+          probe "商汤日日新"  "https://token.sensenova.cn/v1/chat/completions"
+          probe "MiniMax-国际" "https://api.minimax.io/v1/text/chatcompletion_v2"
+          probe "OpenRouter"  "https://openrouter.ai/api/v1/chat/completions"
+          probe "Gemini"      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+
+          echo "--------------------------------------------------------------"
+          echo ""
+          echo "判读：401/400/422/404 = 可达；403 = 被地域或权限拒；000/ERR = 网络不通"
+          echo "挑一个显示 401 或 400 的平台去注册，拿到的 Key 才真能用。"
