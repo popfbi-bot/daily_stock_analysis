@@ -2,8 +2,8 @@ name: auto-screen
 
 on:
   schedule:
-    # 工作日北京时间 17:00（UTC 09:00）盘后选股，赶在主任务 18:00 之前写回 STOCK_LIST
-    - cron: '0 9 * * 1-5'
+    # 工作日北京时间 16:00（UTC 08:00）盘后选股，赶在主任务 17:00 之前写回 STOCK_LIST
+    - cron: '0 8 * * 1-5'
   workflow_dispatch:
 
 # 说明：GITHUB_TOKEN 无法写 Repository Variable/Secret（GitHub 硬限制），
