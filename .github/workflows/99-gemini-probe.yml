@@ -1,0 +1,34 @@
+name: probe-gemini-key
+
+# 轻量探针：验证 GEMINI_API_KEY 是否仍可用（备用通道体检）。
+# 不发邮件、不跑分析，几十秒出结果。Key 通过 header 传递，不会出现在日志里。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 探测 Gemini 备用通道
+        env:
+          GKEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GKEY" ]; then
+            echo "RESULT=GEMINI_API_KEY_NOT_SET"
+            exit 0
+          fi
+          echo "key_len=${#GKEY}"
+          for M in gemini-2.5-flash gemini-3-flash-preview; do
+            CODE=$(curl -s -o /tmp/resp_$M -w "%{http_code}" --max-time 45 \
+              -X POST "https://generativelanguage.googleapis.com/v1beta/models/$M:generateContent" \
+              -H "x-goog-api-key: $GKEY" \
+              -H "Content-Type: application/json" \
+              -d '{"contents":[{"parts":[{"text":"Reply with the single word OK"}]}]}')
+            echo "RESULT model=$M http=$CODE"
+            head -c 220 /tmp/resp_$M
+            echo ""
+          done
