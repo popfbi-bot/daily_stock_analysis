@@ -1,9 +1,7 @@
 # 本仓库已停用自动同步。
 #
 # 同步方式：本机改完代码后跑 tools/dual-push.sh，一次推到 CNB + GitHub。
-# 需要把 GitHub 侧改动拉回本仓库时，手动触发下面的 api_sync 即可。
-#
-# 保留 api_sync 只是为了「手动拉一次」，它不会自己跑。
+# 需要把 GitHub 侧改动拉回本仓库时，手动触发 api_sync（不会自己跑）。
 main:
   api_sync:
     - name: sync-from-github
