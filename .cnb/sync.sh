@@ -5,6 +5,8 @@ OWNER="popfbi-bot"
 START=$(date +%s)
 GH="https://github.com/${OWNER}/${REPO}.git"
 
+TARGET=${TARGET:-main}
+
 emit() {
   cat > SYNC_STATUS.md <<EOF
 # 镜像同步状态
@@ -52,6 +54,8 @@ if [ -z "$DEF" ]; then
   fi
 fi
 echo "  源默认分支: ${DEF:-未探测到}"
+TARGET=$(git branch --show-current 2>/dev/null || echo main)
+echo "  目标分支(CNB侧): $TARGET"
 GH_HEAD=$(git rev-parse "refs/remotes/upstream/$DEF" 2>/dev/null || echo "")
 
 if [ -z "$DEF" ] || [ -z "$GH_HEAD" ]; then
@@ -70,7 +74,7 @@ else
     [ -f .cnb/sync.sh ] || { [ -f /tmp/keepcnb/sync.sh ] && cp -f /tmp/keepcnb/sync.sh .cnb/sync.sh; } || true
     git add -A
     git -c user.email=c@x -c user.name=sync commit -q -m "chore: 首次同步自 GitHub $DEF（保留同步配置）" || true
-    git push --force origin "HEAD:refs/heads/$DEF" || true
+    git push --force origin "HEAD:refs/heads/$TARGET" || true
     DETAIL="bootstrap → $DEF $(git rev-parse --short HEAD)，$(git rev-list --count HEAD) commits"
   else
     CNB_HEAD=$(git rev-parse HEAD)
@@ -79,7 +83,7 @@ else
     else
       echo "  增量快进 $DEF"
       git merge --ff-only "refs/remotes/upstream/$DEF"
-      git push origin "HEAD:refs/heads/$DEF"
+      git push origin "HEAD:refs/heads/$TARGET"
       NEW=$(git rev-parse HEAD)
       if [ "$NEW" = "$GH_HEAD" ]; then STATUS="✅ 同步完成"; DETAIL="${CNB_HEAD:0:8} → ${NEW:0:8}"; else STATUS="⚠️ 部分同步"; DETAIL="期望 ${GH_HEAD:0:8} 实际 ${NEW:0:8}"; fi
     fi
@@ -89,5 +93,5 @@ fi
 emit
 git add SYNC_STATUS.md 2>/dev/null || true
 git -c user.email=c@x -c user.name=sync commit -q -m "sync: 更新状态" || true
-git push origin "HEAD:refs/heads/${DEF:-main}" || true
+git push origin "HEAD:refs/heads/$TARGET" || true
 echo "SYNC_DONE"
