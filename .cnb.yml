@@ -1,0 +1,13 @@
+main:
+  # 每 6 小时自动同步（北京时间 2:17 / 8:17 / 14:17 / 20:17）
+  "crontab: 17 */6 * * *":
+    - name: sync-from-github
+      stages:
+        - name: sync
+          script: sh .cnb/sync.sh
+  # 手动触发：想立刻同步时用
+  api_trigger:
+    - name: sync-now
+      stages:
+        - name: sync
+          script: sh .cnb/sync.sh
