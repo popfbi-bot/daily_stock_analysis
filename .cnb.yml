@@ -1,0 +1,7 @@
+# 本仓库是 github.com/popfbi-bot 的镜像（单向：GitHub -> CNB）
+main:
+  "crontab: 17 */6 * * *":
+    - name: sync-from-github
+      stages:
+        - name: sync
+          script: sh .cnb/sync.sh
