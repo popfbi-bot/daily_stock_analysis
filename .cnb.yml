@@ -1,10 +1,29 @@
-# 本仓库已停用自动同步。
+# ============================================================
+#  同步架构（2026-10-07 起）
+# ============================================================
+#    本机 ──push──> CNB       随时手动（git pushall / tools/cnb-push.sh）
+#    CNB ──crontab(每日 03:17) ──push──> GitHub    失败自动重试
 #
-# 同步方式：本机改完代码后跑 tools/dual-push.sh，一次推到 CNB + GitHub。
-# 需要把 GitHub 侧改动拉回本仓库时，手动触发 api_sync（不会自己跑）。
+#  本机不再直连 GitHub —— 那边的网络常年不稳，每次都要卡在重试上。
+#  改成每天由 CNB 统一同步一次，同步失败会在云端指数退避重试
+#  （单次最多 50 分钟），跨天没补上的由下一次 crontab 接着来。
+#
+#  凭据从密钥仓库 cnb-sync-secrets 经 imports 注入，不落盘、不进 git 历史。
+# ============================================================
 main:
-  api_sync:
-    - name: sync-from-github
+  "crontab: 17 3 * * *":
+    - name: 同步到GitHub
+      imports:
+        - https://cnb.cool/cnbnasa/cnb-sync-secrets/-/blob/main/env.yml
       stages:
-        - name: sync
-          script: sh .cnb/sync.sh
+        - name: push
+          script: sh .cnb/push-to-github.sh
+
+  # 需要立刻同步时手动触发
+  api_trigger:
+    - name: 手动同步到GitHub
+      imports:
+        - https://cnb.cool/cnbnasa/cnb-sync-secrets/-/blob/main/env.yml
+      stages:
+        - name: push
+          script: sh .cnb/push-to-github.sh
