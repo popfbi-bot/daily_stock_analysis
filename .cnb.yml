@@ -18,7 +18,8 @@ main:
       stages:
         - name: push
           script: sh .cnb/push-to-github.sh
-
+          envs:
+            CNB_TO_GH_MAX_MINUTES: "20"
   # 需要立刻同步时手动触发
   api_trigger:
     - name: 手动同步到GitHub
@@ -27,3 +28,5 @@ main:
       stages:
         - name: push
           script: sh .cnb/push-to-github.sh
+          envs:
+            CNB_TO_GH_MAX_MINUTES: "20"

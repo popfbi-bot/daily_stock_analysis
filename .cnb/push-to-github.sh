@@ -21,7 +21,7 @@
 #  环境变量（由 imports 从密钥仓库注入）
 #  ------------------------------------
 #    GITHUB_USERNAME / GITHUB_TOKEN   必需，缺任一则跳过并记原因
-#    CNB_TO_GH_MAX_MINUTES           可选，单次运行上限，默认 50
+#    CNB_TO_GH_MAX_MINUTES           可选，单次运行上限（单位：分钟），默认 20
 # ============================================================
 
 set -u
@@ -34,7 +34,8 @@ GH="https://${GITHUB_USERNAME:-${OWNER}}:${GITHUB_TOKEN}@github.com/${OWNER}/${R
 
 TARGET=$(git branch --show-current 2>/dev/null || echo main)
 [ -z "$TARGET" ] && TARGET=main
-MAX_MINUTES="${CNB_TO_GH_MAX_MINUTES:-50}"
+# 单次运行上限，单位：分钟（.cnb.yml 里的 envs 也用分钟，两边一致）
+MAX_MINUTES="${CNB_TO_GH_MAX_MINUTES:-20}"
 START=$(date +%s)
 
 STATUS="未执行"
