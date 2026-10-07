@@ -30,3 +30,34 @@ main:
           script: sh .cnb/push-to-github.sh
           envs:
             CNB_TO_GH_MAX_MINUTES: "20"
+
+  # --- 网页手动触发事件（按钮定义在 .cnb/web_trigger.yml）---
+  # api_trigger 只能走 API，网页上点不到；web_trigger 才是网页入口。
+
+  web_trigger_sync:
+    - name: 立即同步到 GitHub
+      imports:
+        - https://cnb.cool/cnbnasa/cnb-sync-secrets/-/blob/main/env.yml
+      stages:
+        - name: push
+          script: sh .cnb/push-to-github.sh
+          envs:
+            CNB_TO_GH_MAX_MINUTES: "20"
+
+  web_trigger_check:
+    - name: 同步自检
+      imports:
+        - https://cnb.cool/cnbnasa/cnb-sync-secrets/-/blob/main/env.yml
+      stages:
+        - name: check
+          script: |
+            echo "凭据注入情况："
+            echo "  GITHUB_USERNAME 长度=${#GITHUB_USERNAME}"
+            echo "  GITHUB_TOKEN    长度=${#GITHUB_TOKEN}"
+            echo ""
+            echo "CNB 注入的仓库信息："
+            echo "  CNB_REPO_SLUG = ${CNB_REPO_SLUG:-未注入}"
+            echo "  分支= ${CNB_BRANCH:-main}"
+            echo ""
+            echo "远端连通性："
+            git remote -v | head -4

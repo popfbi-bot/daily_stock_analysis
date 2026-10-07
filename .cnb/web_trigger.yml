@@ -1,0 +1,21 @@
+# ============================================================
+#  网页手动触发按钮
+# ============================================================
+#  api_trigger 只能由 API 调用，CNB 网页上点不到。
+#  网页手动触发的唯一方式是 web_trigger 事件 + 本文件生成的按钮。
+#  按钮出现在「代码 → 分支详情页」。
+#
+#  ⚠️ 本文件不支持 include / imports 语法。
+#     凭据仍由 .cnb.yml 里的 imports 从密钥仓库注入。
+# ============================================================
+
+branch:
+  - buttons:
+      - name: 立即同步到 GitHub
+        description: 推 GitHub；失败自动指数退避重试
+        event: web_trigger_sync
+        groupName: 同步
+      - name: 同步自检
+        description: 只查凭据与远端状态，不推任何东西
+        event: web_trigger_check
+        groupName: 诊断
