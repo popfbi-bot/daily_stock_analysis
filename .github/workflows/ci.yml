@@ -3,6 +3,9 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  # fork 默认不开 PR，CI 永远不会自己触发。加手动触发，改完代码能自验。
+  # 不加 push 触发是故意的：全量后端测试分 3 shard，跑一次代价不小。
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
