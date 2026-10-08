@@ -518,7 +518,53 @@ jobs:
           echo "  Slack: $(([ -n "$SLACK_WEBHOOK_URL" ] || ([ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ])) && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "=========================================="
           echo ""
-          
+
+          # ---- 功能体检：把「静默失效」的能力显式报出来 ----
+          # 背景：search_service 在未配置搜索源时走 is_available=False 分支直接跳过，
+          # 不报错、不失败，只在日志角落留一行小字，很容易被忽略。结果就是报告里
+          # 舆情/新闻/风险/催化四大板块全空，但 CI 一直绿、推送照常发。
+          SEARCH_OK=0
+          if [ -n "$BOCHA_API_KEYS" ] || [ -n "$TAVILY_API_KEYS" ] || [ -n "$SERPAPI_API_KEYS" ] \
+              || [ -n "$MINIMAX_API_KEYS" ] || [ -n "$BRAVE_API_KEYS" ] || [ -n "$SEARXNG_BASE_URLS" ] \
+              || [ "${SEARXNG_PUBLIC_INSTANCES_ENABLED,,}" = "true" ]; then
+            SEARCH_OK=1
+          fi
+          {
+            echo "## 🔍 功能体检结果"
+            echo ""
+            if [ "$SEARCH_OK" = "0" ]; then
+              echo "| 缺失能力 | 直接影响 |"
+              echo "| --- | --- |"
+              echo "| **搜索源未配置** | 报告里 💭 舆情情绪 / 📰 重要信息 / 🚨 风险警报 / ✨ 利好催化 / 📢 最新动态 **全部为空** |"
+              echo ""
+              echo "> 这是**静默失效**：任务不会报错、不会失败，但分析质量大幅下降。"
+              echo ""
+              echo "**修复方式**（任选一个搜索源，配 secret + 在本 workflow env 段暴露）："
+              echo ""
+              echo "| 方案 | 月额度 | 月成本 | 备注 |"
+              echo "| --- | --- | --- | --- |"
+              echo "| **Tavily** | 1000 次 | ¥0 | 推荐，额度约为你月需求（~420 次）的 2 倍 |"
+              echo "| Brave | 2000 次 | ¥0 | 额度更高，免费层可能需绑卡 |"
+              echo "| Bocha 博查 | — | — | 中文优化较好 |"
+              echo ""
+              echo "注：LLM 自带的联网搜索（Gemini grounding / 智谱 web-search）**不能替代**搜索源——"
+              echo "本项目的新闻链路依赖独立搜索 API 返回结构化结果，LLM 内置搜索不提供这些字段。"
+            else
+              echo "✅ 搜索源已配置，舆情/新闻/风险/催化能力正常"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SEARCH_OK" = "0" ]; then
+            echo ""
+            echo "╔══════════════════════════════════════════════════════╗"
+            echo "║  ⚠️  关键能力缺失：搜索源未配置                        ║"
+            echo "║  舆情 / 新闻 / 风险警报 / 催化因素 将全部为空          ║"
+            echo "║  任务仍会「成功」，但报告价值大幅下降                  ║"
+            echo "║  详见本次运行页顶部的「🔍 功能体检结果」              ║"
+            echo "╚══════════════════════════════════════════════════════╝"
+          fi
+          echo ""
+
           # 构建命令行参数
           FORCE_RUN_ARG=""
           if [ "${{ github.event.inputs.force_run }}" = "true" ]; then

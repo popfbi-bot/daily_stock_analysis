@@ -63,17 +63,30 @@ _REF_TX = "https://gu.qq.com/"
 _ctx = ssl.create_default_context()
 
 
-def http_get_json(url, timeout=15, retries=2):
+# 仅这些 HTTP 状态码值得重试：限流与网关类故障多为瞬时。
+# 其余 4xx 说明请求本身有问题（参数错、路径不存在等），重试只是浪费时间。
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def http_get_json(url, timeout=15, retries=3):
     last_err = None
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_err = exc
+            if exc.code not in _RETRYABLE_STATUS:
+                print(f"[auto-screen] HTTP {exc.code} 不可重试，直接放弃")
+                raise
         except Exception as exc:  # noqa: BLE001 - 网络抖动重试
             last_err = exc
-            if attempt < retries:
-                time.sleep(1.0)
+        if attempt < retries:
+            backoff = 1.5 ** attempt  # 1s -> 1.5s -> 2.25s
+            print(f"[auto-screen] 请求失败({last_err})，{backoff:.1f}s 后重试 "
+                  f"[{attempt + 1}/{retries}]")
+            time.sleep(backoff)
     raise last_err
 
 
@@ -92,9 +105,12 @@ def get_universe(top_n):
     """东财延时行情：拉沪深 A 股快照，按成交额降序取活跃 top_n。"""
     fs = "m:0+t:2,m:0+t:23,m:1+t:2,m:1+t:23"  # 沪深主板 + 创业板 + 科创板
     fields = "f12,f14,f3,f5,f6,f62"
+    # 按需拉取。原来固定 pz=5000（一次拉全市场）容易触发上游限流/超时，
+    # 实测报 HTTP 502 Bad Gateway。多留一倍余量用于过滤 ST/退市即可。
+    page_size = max(int(top_n) * 2, 500)
     url = (
         "https://push2delay.eastmoney.com/api/qt/clist/get?"
-        "pn=1&pz=5000&po=1&np=1&fltt=2&invt=2&fid=f6&"
+        f"pn=1&pz={page_size}&po=1&np=1&fltt=2&invt=2&fid=f6&"
         f"fs={urllib.parse.quote(fs, safe=':')}&fields={fields}"
     )
     data = http_get_json(url)
@@ -332,7 +348,14 @@ def run(universe_size, max_stocks, min_stocks, core_codes=None):
     core_codes = core_codes or []
     core_set = set(core_codes)
     print(f"[auto-screen] 拉取活跃股 top {universe_size} ...")
-    universe = get_universe(universe_size)
+    try:
+        universe = get_universe(universe_size)
+    except Exception as exc:  # noqa: BLE001 - 候选池拉取失败不应让整个任务崩
+        # 逐只股票拉取已有容错，这里补最后一层：拉不到候选池就退化为「只保核心池」。
+        # 后面入选数不足 min_stocks 时会自动走 STOCK_LIST_FALLBACK，底仓不会丢。
+        print(f"[auto-screen] 候选池拉取失败: {exc}")
+        print("[auto-screen] 降级为核心池模式：本轮不做增补，保留核心自选股")
+        universe = []
     print(f"[auto-screen] 候选池 {len(universe)} 只；核心池 {len(core_codes)} 只（始终保留，机器人不删）")
 
     strict, relaxed = [], []
